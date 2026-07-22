@@ -8,6 +8,8 @@ from google.cloud import storage
 from google.cloud import run_v2
 import requests
 import time
+import datetime
+from pdf_generator import generate_audited_pdf
 
 # Configure Streamlit page
 st.set_page_config(
@@ -100,6 +102,190 @@ def fetch_anomalies():
         st.error(f"Error fetching anomalies: {e}")
         return pd.DataFrame()
 
+@st.cache_data(ttl=15)
+def fetch_all_overrides():
+    if not client:
+        return pd.DataFrame()
+    query = """
+    SELECT shipment_id, document_type, field_name, original_value, audited_value
+    FROM `it-ai-briggs-agentspace.logistics_dataset.Audited_Overrides_Tbl`
+    """
+    try:
+        return client.query(query).to_dataframe()
+    except Exception as e:
+        st.error(f"Error fetching overrides: {e}")
+        return pd.DataFrame()
+
+def fetch_document_data(shipment_id, doc_type):
+    if not client:
+        return {}
+    table_map = {
+        "CIV": "CIV_Tbl",
+        "PKL": "PKL_Tbl",
+        "SLI": "SLI_Tbl",
+        "VGM": "VGM_Tbl"
+    }
+    table_name = table_map.get(doc_type)
+    if not table_name:
+        return {}
+    query = f"""
+    SELECT * FROM `it-ai-briggs-agentspace.logistics_dataset.{table_name}`
+    WHERE shipment_id = @shipment_id
+    ORDER BY processed_at DESC
+    LIMIT 1
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("shipment_id", "STRING", shipment_id)
+        ]
+    )
+    try:
+        df = client.query(query, job_config=job_config).to_dataframe()
+        if not df.empty:
+            return df.iloc[0].to_dict()
+    except Exception as e:
+        st.error(f"Error fetching original {doc_type} data: {e}")
+    return {}
+
+def fetch_resolved_document_data(shipment_id, doc_type):
+    # 1. Fetch original raw data
+    data = fetch_document_data(shipment_id, doc_type)
+    if not data:
+        return {}
+    
+    # 2. Fetch overrides for this shipment and doc_type
+    if not client:
+        return data
+        
+    query = """
+    SELECT field_name, audited_value
+    FROM `it-ai-briggs-agentspace.logistics_dataset.Audited_Overrides_Tbl`
+    WHERE shipment_id = @shipment_id AND document_type = @doc_type
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("shipment_id", "STRING", shipment_id),
+            bigquery.ScalarQueryParameter("doc_type", "STRING", doc_type)
+        ]
+    )
+    try:
+        df = client.query(query, job_config=job_config).to_dataframe()
+        for idx, row in df.iterrows():
+            field = row['field_name']
+            val_str = row['audited_value']
+            
+            # Cast back to the original field's type if possible
+            if field in data:
+                orig_val = data[field]
+                try:
+                    if isinstance(orig_val, float):
+                        data[field] = float(val_str)
+                    elif isinstance(orig_val, int):
+                        data[field] = int(float(val_str))
+                    else:
+                        data[field] = val_str
+                except ValueError:
+                    data[field] = val_str
+            elif field.startswith("items_"):
+                # Parse and apply nested array element overrides (e.g. items_0_gross_weight_kg)
+                parts = field.split("_")
+                try:
+                    array_idx = int(parts[1])
+                    sub_field = "_".join(parts[2:])
+                    items_list = data.get("items", [])
+                    if hasattr(items_list, "tolist"):
+                        items_list = items_list.tolist()
+                    elif not isinstance(items_list, list):
+                        items_list = list(items_list)
+                        
+                    if array_idx < len(items_list):
+                        orig_val = items_list[array_idx].get(sub_field)
+                        try:
+                            if isinstance(orig_val, float):
+                                items_list[array_idx][sub_field] = float(val_str)
+                            elif isinstance(orig_val, int):
+                                items_list[array_idx][sub_field] = int(float(val_str))
+                            else:
+                                items_list[array_idx][sub_field] = val_str
+                        except ValueError:
+                            items_list[array_idx][sub_field] = val_str
+                    data["items"] = items_list
+                except Exception:
+                    pass
+    except Exception as e:
+        st.error(f"Error fetching overrides for {doc_type}: {e}")
+        
+    return data
+
+def is_field_in_doc(field, doc_type):
+    if doc_type == "CIV":
+        return field in ['total_amount']
+    elif doc_type == "PKL":
+        return field in ['gross_weight_lb', 'gross_weight_kg', 'net_weight_lb', 'net_weight_kg', 'pallet_count', 'loose_case_count']
+    elif doc_type == "SLI":
+        return field in ['total_value_usd', 'gross_weight_kg', 'net_weight_kg', 'Gross Weight (KG)', 'Net Weight (KG)', 'Total Amount']
+    elif doc_type == "VGM":
+        return field in ['gross_weight_lb', 'gross_weight_kg']
+    return False
+
+def save_overrides(shipment_id, doc_type, overrides_dict):
+    if not client:
+        return False
+        
+    fields = list(overrides_dict.keys())
+    if not fields:
+        return True
+        
+    # Clear previous overrides for these fields to avoid duplication
+    for field, val in overrides_dict.items():
+        delete_query = """
+        DELETE FROM `it-ai-briggs-agentspace.logistics_dataset.Audited_Overrides_Tbl`
+        WHERE shipment_id = @shipment_id AND document_type = @doc_type AND field_name = @field
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("shipment_id", "STRING", shipment_id),
+                bigquery.ScalarQueryParameter("doc_type", "STRING", doc_type),
+                bigquery.ScalarQueryParameter("field", "STRING", field)
+            ]
+        )
+        try:
+            client.query(delete_query, job_config=job_config).result()
+        except Exception as e:
+            st.error(f"Error clearing previous overrides: {e}")
+            return False
+
+    # Insert new override rows via standard transactional DML queries (bypasses streaming buffer)
+    orig_data = fetch_document_data(shipment_id, doc_type)
+    
+    for field, val in overrides_dict.items():
+        orig_val_str = str(orig_data.get(field, ""))
+        
+        insert_query = """
+        INSERT INTO `it-ai-briggs-agentspace.logistics_dataset.Audited_Overrides_Tbl`
+        (shipment_id, document_type, field_name, original_value, audited_value, updated_at)
+        VALUES
+        (@shipment_id, @doc_type, @field, @orig_val, @audited_val, @updated_at)
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("shipment_id", "STRING", shipment_id),
+                bigquery.ScalarQueryParameter("doc_type", "STRING", doc_type),
+                bigquery.ScalarQueryParameter("field", "STRING", field),
+                bigquery.ScalarQueryParameter("orig_val", "STRING", orig_val_str),
+                bigquery.ScalarQueryParameter("audited_val", "STRING", str(val)),
+                bigquery.ScalarQueryParameter("updated_at", "TIMESTAMP", datetime.datetime.now(datetime.timezone.utc))
+            ]
+        )
+        try:
+            client.query(insert_query, job_config=job_config).result()
+        except Exception as e:
+            st.error(f"Error inserting override for {field}: {e}")
+            return False
+            
+    return True
+
+
 def trigger_ingestion_pipeline():
     """
     Programmatically triggers the Google Cloud Run Job responsible 
@@ -177,16 +363,33 @@ st.divider()
 with st.spinner("Loading shipment data..."):
     all_shipment_data = fetch_all_shipments()
     anomalies_df = fetch_anomalies()
+    overrides_df = fetch_all_overrides()
 
 # Prepare Master Queue Data
 if not all_shipment_data and anomalies_df.empty:
     st.warning("No shipment data found or BigQuery query failed.")
     st.stop()
 
-# Determine Failed Shipments
+# Determine Failed vs Resolved Shipments
 failed_shipment_ids = set()
+resolved_shipment_ids = set()
+
 if not anomalies_df.empty:
-    failed_shipment_ids = set(anomalies_df['shipment_id'].unique())
+    for sid in anomalies_df['shipment_id'].unique():
+        shipment_anoms = anomalies_df[anomalies_df['shipment_id'] == sid]
+        if overrides_df.empty:
+            failed_shipment_ids.add(sid)
+            continue
+            
+        shipment_overrides = overrides_df[overrides_df['shipment_id'] == sid]
+        # Check if all anomalies are covered by overrides
+        anomaly_fields = set(shipment_anoms['field_flagged'].unique())
+        override_fields = set(shipment_overrides['field_name'].unique())
+        
+        if anomaly_fields.issubset(override_fields):
+            resolved_shipment_ids.add(sid)
+        else:
+            failed_shipment_ids.add(sid)
 
 # Ensure all shipments from anomalies_df are also in the queue, 
 # in case the union query missed some shipments for some reason.
@@ -200,7 +403,12 @@ if not anomalies_df.empty:
 queue_data = []
 for row in all_shipment_data:
     sid = row['shipment_id']
-    status = "Failed" if sid in failed_shipment_ids else "Passed"
+    if sid in failed_shipment_ids:
+        status = "Failed"
+    elif sid in resolved_shipment_ids:
+        status = "Resolved"
+    else:
+        status = "Passed"
     queue_data.append({"shipment_id": sid, "Status": status, "processed_at": row.get('processed_at')})
 
 queue_df = pd.DataFrame(queue_data)
@@ -214,6 +422,7 @@ if not queue_df.empty and 'processed_at' in queue_df.columns:
         .dt.tz_convert('America/Chicago')
         .dt.strftime('%Y-%m-%d %H:%M:%S')
     )
+
 
 
 # Initialize State
@@ -231,7 +440,7 @@ if st.session_state.current_view == 'master':
     with filter_col1:
         search_term = st.text_input("Search by Shipment ID", "")
     with filter_col2:
-        status_filter = st.multiselect("Filter by Status", ["Passed", "Failed"], default=["Passed", "Failed"])
+        status_filter = st.multiselect("Filter by Status", ["Passed", "Failed", "Resolved"], default=["Passed", "Failed", "Resolved"])
         
     if not queue_df.empty:
         filtered_df = queue_df[
@@ -242,7 +451,12 @@ if st.session_state.current_view == 'master':
         filtered_df = pd.DataFrame()
 
     def color_status(val):
-        color = 'red' if val == 'Failed' else 'green'
+        if val == 'Failed':
+            color = 'red'
+        elif val == 'Resolved':
+            color = 'orange'
+        else:
+            color = 'green'
         return f'color: {color}; font-weight: bold'
 
     if not filtered_df.empty:
@@ -284,46 +498,345 @@ elif st.session_state.current_view == 'detail':
         if pd.notnull(processed_at):
             st.caption(f"**Processed At:** {processed_at}")
             
+    # 1. Fetch all PDFs and populate document_map upfront
+    document_map = {}
+    pdf_blobs = []
+    bucket_name = "logistic-audit-pdfs"
+    if gcs_client:
+        prefix = f"shipment_{selected_shipment}/"
+        try:
+            bucket = gcs_client.bucket(bucket_name)
+            blobs = list(bucket.list_blobs(prefix=prefix))
+            pdf_blobs = [b for b in blobs if b.name.lower().endswith('.pdf')]
+            
+            for b in pdf_blobs:
+                name = b.name.split('/')[-1]
+                if "civ" in name.lower():
+                    doc_type = "CIV"
+                elif "pkl" in name.lower():
+                    doc_type = "PKL"
+                elif "sli" in name.lower():
+                    doc_type = "SLI"
+                elif "vgm" in name.lower():
+                    doc_type = "VGM"
+                else:
+                    doc_type = "OTHER"
+                    
+                if doc_type not in document_map:
+                    document_map[doc_type] = {'original': None, 'audited': None}
+                    
+                if "_audited" in name.lower():
+                    document_map[doc_type]['audited'] = b
+                else:
+                    document_map[doc_type]['original'] = b
+        except Exception as e:
+            st.error(f"Error fetching PDFs from GCS: {e}")
+
+    # Now create layout columns
     insp_col_left, insp_col_right = st.columns([1, 1])
     
     with insp_col_left:
         st.markdown("#### 📄 Document Viewer")
         if not gcs_client:
             st.error("GCS Client not initialized.")
+        elif not pdf_blobs:
+            st.info(f"No PDFs found for shipment {selected_shipment} in GCS bucket {bucket_name}.")
         else:
-            bucket_name = "logistic-audit-pdfs"
-            prefix = f"shipment_{selected_shipment}/"
-            try:
-                bucket = gcs_client.bucket(bucket_name)
-                blobs = list(bucket.list_blobs(prefix=prefix))
-                pdf_blobs = [b for b in blobs if b.name.lower().endswith('.pdf')]
+            # Render Document Type selector
+            available_types = sorted(list(document_map.keys()))
+            sorted_types = sorted(available_types, key=lambda x: {"CIV": 1, "PKL": 2, "SLI": 3, "VGM": 4}.get(x, 5))
+            selected_doc_type = st.selectbox("Select Document Type", options=sorted_types)
+            
+            doc_versions = document_map[selected_doc_type]
+            has_audited = doc_versions['audited'] is not None
+            
+            if has_audited:
+                st.success("✨ Audited version is available for this document!")
+                version_choice = st.radio(
+                    "Document Version to View",
+                    options=["Original PDF", "Audited PDF"],
+                    horizontal=True,
+                    key=f"version_radio_{selected_doc_type}"
+                )
+            else:
+                version_choice = "Original PDF"
+                st.info("Showing original PDF (No corrections audited yet)")
                 
-                if not pdf_blobs:
-                    st.info(f"No PDFs found for shipment {selected_shipment} in GCS bucket {bucket_name}.")
-                else:
-                    selected_blob = pdf_blobs[0]
-                    if len(pdf_blobs) > 1:
-                        blob_names = [b.name.split('/')[-1] for b in pdf_blobs]
-                        selected_name = st.selectbox("Select Document", options=blob_names)
-                        selected_blob = next(b for b in pdf_blobs if b.name.endswith(selected_name))
-                        
-                    with st.spinner(f"Loading {selected_blob.name.split('/')[-1]}..."):
-                        pdf_bytes = selected_blob.download_as_bytes()
-                        base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
-                        pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="600px" type="application/pdf"></iframe>'
-                        st.markdown(pdf_display, unsafe_allow_html=True)
-            except Exception as e:
-                st.error(f"Error fetching PDFs from GCS: {e}")
+            selected_blob = doc_versions['audited'] if version_choice == "Audited PDF" else doc_versions['original']
+            
+            if selected_blob:
+                with st.spinner(f"Loading {selected_blob.name.split('/')[-1]}..."):
+                    pdf_bytes = selected_blob.download_as_bytes()
+                    base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
+                    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="600px" type="application/pdf"></iframe>'
+                    st.markdown(pdf_display, unsafe_allow_html=True)
+            else:
+                st.warning(f"No original PDF file found for {selected_doc_type}.")
         
     with insp_col_right:
         st.markdown("#### ⚠️ Identified Anomalies")
-        shipment_anomalies = anomalies_df[anomalies_df['shipment_id'] == selected_shipment]
+        shipment_anomalies = anomalies_df[anomalies_df['shipment_id'] == selected_shipment].copy()
+        
+        # Fetch overrides for this shipment
+        shipment_overrides = overrides_df[overrides_df['shipment_id'] == selected_shipment] if not overrides_df.empty else pd.DataFrame()
         
         if not shipment_anomalies.empty:
+            def get_anomaly_status(row):
+                field = row['field_flagged']
+                if not shipment_overrides.empty and field in shipment_overrides['field_name'].values:
+                    return "✅ Resolved"
+                return "❌ Unresolved"
+                
+            shipment_anomalies['Status'] = shipment_anomalies.apply(get_anomaly_status, axis=1)
+            
             st.dataframe(
-                shipment_anomalies[['discrepancy_category', 'field_flagged', 'expected_value', 'actual_value']],
+                shipment_anomalies[['discrepancy_category', 'field_flagged', 'expected_value', 'actual_value', 'Status']],
                 use_container_width=True,
                 hide_index=True
             )
         else:
             st.success("🎉 No anomalies found! This shipment passed all checks.")
+            
+        st.divider()
+        st.markdown("### ✏️ Auditor Corrections & Re-generation")
+        st.caption("Expand any document to make manual overrides. Document types with active anomalies are auto-expanded with warnings.")
+        
+        # Build list of editable document types present for this shipment
+        editable_types = [dt for dt in ["CIV", "PKL", "SLI", "VGM"] if dt in document_map]
+        
+        if not editable_types:
+            st.info("No supported logistics documents found for this shipment to edit.")
+        else:
+            all_new_values = {}
+            all_resolved_data = {}
+            
+            # Start a single global form for saving all corrections at once
+            with st.form(key="global_corrections_form"):
+                for dt in editable_types:
+                    # 1. Determine if this specific document type has any active anomalies
+                    doc_has_anomaly = False
+                    if not shipment_anomalies.empty:
+                        # An anomaly is for this doc if category contains the doc type, or if the flagged field belongs to this doc
+                        is_flagged_field = shipment_anomalies['field_flagged'].apply(lambda f: is_field_in_doc(f, dt))
+                        is_matching_cat = shipment_anomalies['discrepancy_category'].str.contains(dt, case=False, na=False)
+                        doc_has_anomaly = (is_flagged_field | is_matching_cat).any()
+                    
+                    # 2. Fetch resolved data for this document type
+                    resolved_data = fetch_resolved_document_data(selected_shipment, dt)
+                    if not resolved_data:
+                        continue
+                    all_resolved_data[dt] = resolved_data
+                    all_new_values[dt] = {}
+                    
+                    # 3. Create expander. Expanded by default if there are anomalies!
+                    expander_label = f"📝 {dt} Corrections ⚠️" if doc_has_anomaly else f"📝 {dt} Corrections"
+                    with st.expander(expander_label, expanded=doc_has_anomaly):
+                        if dt == "CIV":
+                            val = float(resolved_data.get('total_amount', 0.0))
+                            is_flagged = not shipment_anomalies.empty and 'total_amount' in shipment_anomalies['field_flagged'].values
+                            label = "Total Invoice Amount (USD) ⚠️" if is_flagged else "Total Invoice Amount (USD)"
+                            all_new_values[dt]['total_amount'] = st.number_input(label, value=val, step=100.0, format="%.2f", key=f"input_{dt}_total_amount")
+                            
+                        elif dt == "PKL":
+                            for field in ['gross_weight_lb', 'gross_weight_kg', 'net_weight_lb', 'net_weight_kg', 'pallet_count', 'loose_case_count']:
+                                val = resolved_data.get(field, 0.0)
+                                val = 0.0 if pd.isna(val) else float(val)
+                                is_flagged = not shipment_anomalies.empty and field in shipment_anomalies['field_flagged'].values
+                                label = f"{field.replace('_', ' ').title()} ⚠️" if is_flagged else field.replace('_', ' ').title()
+                                
+                                if 'count' in field:
+                                    all_new_values[dt][field] = st.number_input(label, value=int(val), step=1, key=f"input_{dt}_{field}")
+                                else:
+                                    all_new_values[dt][field] = st.number_input(label, value=val, step=10.0, format="%.2f", key=f"input_{dt}_{field}")
+                                    
+                        elif dt == "SLI":
+                            # 1. Total value (USD)
+                            val = float(resolved_data.get('total_value_usd', 0.0))
+                            is_flagged = not shipment_anomalies.empty and 'Total Amount' in shipment_anomalies['field_flagged'].values
+                            label = "Total Value (USD) ⚠️" if is_flagged else "Total Value (USD)"
+                            all_new_values[dt]['total_value_usd'] = st.number_input(label, value=val, step=100.0, format="%.2f", key=f"input_{dt}_total_value_usd")
+                            
+                            # 2. Package Line items
+                            items_list = resolved_data.get("items", [])
+                            if hasattr(items_list, "tolist"):
+                                items_list = items_list.tolist()
+                            elif not isinstance(items_list, list):
+                                items_list = list(items_list)
+                                
+                            if items_list:
+                                st.write("**Package Line Items weights & values:**")
+                                for idx, item in enumerate(items_list):
+                                    st.markdown(f"📦 *Item #{idx + 1}*")
+                                    col1, col2, col3 = st.columns(3)
+                                    with col1:
+                                        it_val = float(item.get("value_usd", 0.0))
+                                        all_new_values[dt][f"items_{idx}_value_usd"] = st.number_input(
+                                            "Value (USD)", value=it_val, step=10.0, format="%.2f", key=f"input_{dt}_items_{idx}_value_usd"
+                                        )
+                                    with col2:
+                                        it_gross = float(item.get("gross_weight_kg", 0.0))
+                                        is_gross_flagged = not shipment_anomalies.empty and 'Gross Weight (KG)' in shipment_anomalies['field_flagged'].values
+                                        label_gross = "Gross Wt (kg) ⚠️" if is_gross_flagged else "Gross Wt (kg)"
+                                        all_new_values[dt][f"items_{idx}_gross_weight_kg"] = st.number_input(
+                                            label_gross, value=it_gross, step=1.0, format="%.1f", key=f"input_{dt}_items_{idx}_gross_weight_kg"
+                                        )
+                                    with col3:
+                                        it_net = float(item.get("net_weight_kg", 0.0))
+                                        is_net_flagged = not shipment_anomalies.empty and 'Net Weight (KG)' in shipment_anomalies['field_flagged'].values
+                                        label_net = "Net Wt (kg) ⚠️" if is_net_flagged else "Net Wt (kg)"
+                                        all_new_values[dt][f"items_{idx}_net_weight_kg"] = st.number_input(
+                                            label_net, value=it_net, step=1.0, format="%.1f", key=f"input_{dt}_items_{idx}_net_weight_kg"
+                                        )
+                                
+                        elif dt == "VGM":
+                            for field in ['gross_weight_lb', 'gross_weight_kg']:
+                                val = resolved_data.get(field, 0.0)
+                                val = 0.0 if pd.isna(val) else float(val)
+                                is_flagged = not shipment_anomalies.empty and field in shipment_anomalies['field_flagged'].values
+                                label = f"{field.replace('_', ' ').title()} ⚠️" if is_flagged else field.replace('_', ' ').title()
+                                all_new_values[dt][field] = st.number_input(label, value=val, step=10.0, format="%.2f", key=f"input_{dt}_{field}")
+                
+                # Master Save/Regenerate button
+                submit_button = st.form_submit_button(
+                    "💾 Save All Corrections & Re-generate PDFs",
+                    type="primary",
+                    use_container_width=True
+                )
+                
+                if submit_button:
+                    modified_docs = []
+                    with st.spinner("Analyzing overrides and re-generating target PDF documents..."):
+                        # Process edits for each document
+                        for dt, new_vals in all_new_values.items():
+                            orig_vals = all_resolved_data[dt]
+                            
+                            if dt == "SLI":
+                                # Automatically calculate root-level grand weight totals by summing line item inputs
+                                calc_gross = sum(float(val) for f, val in new_vals.items() if f.startswith("items_") and f.endswith("_gross_weight_kg"))
+                                calc_net = sum(float(val) for f, val in new_vals.items() if f.startswith("items_") and f.endswith("_net_weight_kg"))
+                                new_vals['gross_weight_kg'] = calc_gross
+                                new_vals['net_weight_kg'] = calc_net
+                            
+                            # Check if anything changed
+                            has_changes = False
+                            changed_values = {}
+                            for f, val in new_vals.items():
+                                if f.startswith("items_"):
+                                    # Nested list element
+                                    parts = f.split("_")
+                                    try:
+                                        array_idx = int(parts[1])
+                                        sub_field = "_".join(parts[2:])
+                                        items_list = orig_vals.get("items", [])
+                                        if hasattr(items_list, "tolist"):
+                                            items_list = items_list.tolist()
+                                        
+                                        orig_sub_val = None
+                                        if array_idx < len(items_list):
+                                            orig_sub_val = items_list[array_idx].get(sub_field)
+                                            
+                                        if str(orig_sub_val) != str(val):
+                                            has_changes = True
+                                            changed_values[f] = val
+                                    except Exception:
+                                        pass
+                                else:
+                                    # Standard scalar field
+                                    if str(orig_vals.get(f)) != str(val):
+                                        has_changes = True
+                                        changed_values[f] = val
+                                    
+                            if has_changes:
+                                # Save overrides to BigQuery
+                                success = save_overrides(selected_shipment, dt, changed_values)
+                                if success:
+                                    # Fetch updated fully-resolved data
+                                    full_resolved_data = fetch_resolved_document_data(selected_shipment, dt)
+                                    original_blob = document_map[dt]['original']
+                                    if original_blob:
+                                        try:
+                                            # Fetch raw original data for text coordinate matching
+                                            original_data = fetch_document_data(selected_shipment, dt)
+                                            # Download template background
+                                            original_pdf_bytes = original_blob.download_as_bytes()
+                                            
+                                            # Render and redact direct in-place PDF
+                                            pdf_bytes = generate_audited_pdf(
+                                                selected_shipment,
+                                                dt,
+                                                full_resolved_data,
+                                                original_data,
+                                                original_pdf_bytes
+                                            )
+                                            
+                                            original_name = original_blob.name
+                                            if "_audited" in original_name.lower():
+                                                target_name = original_name
+                                            else:
+                                                target_name = original_name[:-4] + "_audited.pdf"
+                                                
+                                            bucket = gcs_client.bucket(bucket_name)
+                                            blob = bucket.blob(target_name)
+                                            blob.upload_from_string(pdf_bytes, content_type="application/pdf")
+                                            
+                                            modified_docs.append(dt)
+                                        except Exception as gen_err:
+                                            st.error(f"Error during {dt} PDF generation/upload: {gen_err}")
+                                    else:
+                                        st.error(f"No original GCS blob reference found to name the audited {dt} PDF.")
+                                else:
+                                    st.error(f"Failed to save corrections for {dt} to BigQuery.")
+                                    
+                        if modified_docs:
+                            st.cache_data.clear()
+                            st.success(f"✅ Successfully saved and re-generated PDFs for: {', '.join(modified_docs)}!")
+                            time.sleep(1.5)
+                            st.rerun()
+                        else:
+                            st.info("No modifications detected. No documents needed re-generation.")
+            
+            # Place Reset buttons below the global form
+            audited_docs = [dt for dt in editable_types if document_map[dt]['audited'] is not None]
+            if audited_docs:
+                st.markdown("<div style='height: 15px;'></div>", unsafe_allow_html=True)
+                st.markdown("#### 🗑️ Reset Audit Corrections")
+                reset_cols = st.columns(len(audited_docs))
+                for idx, dt in enumerate(audited_docs):
+                    with reset_cols[idx]:
+                        reset_btn = st.button(
+                            f"Reset {dt}",
+                            type="secondary",
+                            use_container_width=True,
+                            key=f"global_reset_btn_{dt}"
+                        )
+                        if reset_btn:
+                            with st.spinner(f"Resetting {dt} corrections..."):
+                                if client:
+                                    delete_query = """
+                                    DELETE FROM `it-ai-briggs-agentspace.logistics_dataset.Audited_Overrides_Tbl`
+                                    WHERE shipment_id = @shipment_id AND document_type = @doc_type
+                                    """
+                                    job_config = bigquery.QueryJobConfig(
+                                        query_parameters=[
+                                            bigquery.ScalarQueryParameter("shipment_id", "STRING", selected_shipment),
+                                            bigquery.ScalarQueryParameter("doc_type", "STRING", dt)
+                                        ]
+                                    )
+                                    try:
+                                        client.query(delete_query, job_config=job_config).result()
+                                        
+                                        # Delete audited PDF from GCS
+                                        audited_blob = document_map[dt]['audited']
+                                        if audited_blob:
+                                            try:
+                                                audited_blob.delete()
+                                            except Exception:
+                                                pass
+                                                
+                                        # Clear cache and reload
+                                        st.cache_data.clear()
+                                        st.success(f"✅ Successfully reset {dt} corrections!")
+                                        time.sleep(1.5)
+                                        st.rerun()
+                                    except Exception as reset_err:
+                                        st.error(f"Error resetting {dt} corrections: {reset_err}")
