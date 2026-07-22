@@ -1,0 +1,9 @@
+streamlit
+google-cloud-bigquery
+pandas
+requests
+db-dtypes
+google-cloud-storage
+google-cloud-run
+reportlab
+pymupdf

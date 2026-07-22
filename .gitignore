@@ -1,0 +1,29 @@
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Streamlit Cache
+.streamlit/
+*.port
+
+# Google Cloud & Credentials
+*.json
+service-account*.json
+key*.json
+credentials/
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Generated / Local PDFs
+scratch/
+test_*.pdf
+*_audited.pdf
