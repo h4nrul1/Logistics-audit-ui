@@ -1,0 +1,7 @@
+google-genai==0.5.0
+functions-framework==3.5.0
+google-cloud-bigquery==3.20.1
+google-cloud-storage
+google-cloud-pubsub
+google-api-python-client
+google-auth
