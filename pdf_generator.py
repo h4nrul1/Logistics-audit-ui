@@ -13,25 +13,31 @@ def get_candidates(field, val):
         val_float = float(val)
         val_int = int(val_float)
         
-        # 1. Comma with 2 decimals (e.g., 94,725.00)
+        # 1. Comma with 3 decimals (e.g., 14,210.500)
+        candidates.append((f"{val_float:,.3f}", lambda x: f"{float(x):,.3f}"))
+        
+        # 2. Comma with 2 decimals (e.g., 94,725.00)
         candidates.append((f"{val_float:,.2f}", lambda x: f"{float(x):,.2f}"))
         
-        # 2. Comma with 1 decimal (e.g., 14,210.5)
+        # 3. Comma with 1 decimal (e.g., 14,210.5)
         candidates.append((f"{val_float:,.1f}", lambda x: f"{float(x):,.1f}"))
         
-        # 3. No comma with 2 decimals (e.g., 94725.00)
+        # 4. No comma with 3 decimals (e.g., 14210.500)
+        candidates.append((f"{val_float:.3f}", lambda x: f"{float(x):.3f}"))
+        
+        # 5. No comma with 2 decimals (e.g., 94725.00)
         candidates.append((f"{val_float:.2f}", lambda x: f"{float(x):.2f}"))
         
-        # 4. No comma with 1 decimal (e.g., 14210.5)
+        # 6. No comma with 1 decimal (e.g., 14210.5)
         candidates.append((f"{val_float:.1f}", lambda x: f"{float(x):.1f}"))
         
-        # 5. Comma with no decimals (e.g., 94,725)
+        # 7. Comma with no decimals (e.g., 94,725)
         candidates.append((f"{val_int:,}", lambda x: f"{int(float(x)):,}"))
         
-        # 6. Raw integer (e.g., 14)
+        # 8. Raw integer (e.g., 14)
         candidates.append((f"{val_int}", lambda x: f"{int(float(x))}"))
         
-        # 7. Raw float string representation
+        # 9. Raw float string representation
         candidates.append((str(val), lambda x: str(x)))
     except (ValueError, TypeError):
         # String fallback
@@ -44,6 +50,9 @@ def get_candidates(field, val):
         if search_str not in seen and search_str != "" and search_str != "0.0" and search_str != "0":
             seen.add(search_str)
             unique_candidates.append((search_str, formatter))
+            
+    # Sort candidates by length in descending order to match the longest (most precise) string first
+    unique_candidates.sort(key=lambda x: len(x[0]), reverse=True)
     return unique_candidates
 
 def generate_audited_pdf(shipment_id, document_type, resolved_data, original_data, original_pdf_bytes):
@@ -108,9 +117,10 @@ def generate_audited_pdf(shipment_id, document_type, resolved_data, original_dat
                 if rects:
                     found_any = True
                     for rect in rects:
-                        # 1. Redact / mask old text with white
+                        # 1. Redact / mask old text with white (adding a 4px padding on the right to cover any trailing unaligned decimal places)
+                        redact_rect = fitz.Rect(rect.x0, rect.y0, rect.x1 + 4, rect.y1)
                         page.draw_rect(
-                            rect,
+                            redact_rect,
                             color=fitz.pdfcolor["white"],
                             fill=fitz.pdfcolor["white"]
                         )
@@ -122,13 +132,15 @@ def generate_audited_pdf(shipment_id, document_type, resolved_data, original_dat
                         h = rect.y1 - rect.y0
                         fontsize = max(8, min(11, h * 0.85)) # Dynamic font scaling
                         
-                        # Use standard clean Helvetica font
+                        # Select font based on document type (use Courier 'cour' for monospaced ERP grid layouts to match style and column alignment)
+                        fontname = "cour" if document_type in ["SLI", "PKL", "CIV"] else "helv"
+                        
                         page.insert_text(
                             fitz.Point(rect.x0, rect.y1 - 1.5), # Anchor at bottom-left
                             new_text,
                             fontsize=fontsize,
-                            fontname="helv",
-                            color=(0, 0, 0) # Black text
+                            fontname=fontname,
+                            color=(0.15, 0.15, 0.15) # Elegant corporate charcoal text
                         )
             # If we found and replaced this candidate on any page,
             # we don't need to try the other less-precise candidate formats for this field.

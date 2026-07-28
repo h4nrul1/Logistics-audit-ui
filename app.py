@@ -147,12 +147,30 @@ def fetch_document_data(shipment_id, doc_type):
         st.error(f"Error fetching original {doc_type} data: {e}")
     return {}
 
+def ensure_list(val):
+    if val is None:
+        return []
+    if hasattr(val, "tolist"):
+        try:
+            return val.tolist()
+        except Exception:
+            pass
+    if isinstance(val, list):
+        return val
+    try:
+        return list(val)
+    except Exception:
+        return []
+
 def fetch_resolved_document_data(shipment_id, doc_type):
     # 1. Fetch original raw data
     data = fetch_document_data(shipment_id, doc_type)
     if not data:
         return {}
     
+    if "items" in data:
+        data["items"] = ensure_list(data["items"])
+
     # 2. Fetch overrides for this shipment and doc_type
     if not client:
         return data
@@ -192,13 +210,8 @@ def fetch_resolved_document_data(shipment_id, doc_type):
                 try:
                     array_idx = int(parts[1])
                     sub_field = "_".join(parts[2:])
-                    items_list = data.get("items", [])
-                    if hasattr(items_list, "tolist"):
-                        items_list = items_list.tolist()
-                    elif not isinstance(items_list, list):
-                        items_list = list(items_list)
-                        
-                    if array_idx < len(items_list):
+                    items_list = ensure_list(data.get("items"))
+                    if array_idx < len(items_list) and isinstance(items_list[array_idx], dict):
                         orig_val = items_list[array_idx].get(sub_field)
                         try:
                             if isinstance(orig_val, float):
@@ -215,7 +228,137 @@ def fetch_resolved_document_data(shipment_id, doc_type):
     except Exception as e:
         st.error(f"Error fetching overrides for {doc_type}: {e}")
         
+    if doc_type == "SLI" and "items" in data:
+        items_list = ensure_list(data["items"])
+        if items_list:
+            val_sum = sum(float(it.get("value_usd", 0.0) or 0.0) for it in items_list if isinstance(it, dict))
+            if val_sum > 0:
+                data["total_value_usd"] = val_sum
+            gw_sum = sum(float(it.get("gross_weight_kg", 0.0) or 0.0) for it in items_list if isinstance(it, dict))
+            if gw_sum > 0:
+                data["gross_weight_kg"] = gw_sum
+            nw_sum = sum(float(it.get("net_weight_kg", 0.0) or 0.0) for it in items_list if isinstance(it, dict))
+            if nw_sum > 0:
+                data["net_weight_kg"] = nw_sum
+
     return data
+
+def is_value_changed(val1, val2):
+    if val1 is None or val2 is None:
+        return val1 != val2
+    try:
+        # Check mathematically with a 0.05 float tolerance to absorb minor extraction rounding/formatting differences
+        return abs(float(val1) - float(val2)) > 0.05
+    except (ValueError, TypeError):
+        return str(val1).strip() != str(val2).strip()
+
+def normalize_field_name(name):
+    if not name:
+        return ""
+    n = name.lower()
+    for term in ['_', '(', ')', 'kg', 'lb', 'usd', 'amount', 'value']:
+        n = n.replace(term, " ")
+    words = [w.strip() for w in n.split() if w.strip()]
+    return "".join(words)
+
+def is_anomaly_resolved(flagged_field, shipment_overrides):
+    if shipment_overrides.empty:
+        return False
+        
+    norm_flagged = normalize_field_name(flagged_field)
+    
+    for ov_field in shipment_overrides['field_name'].values:
+        norm_ov = normalize_field_name(ov_field)
+        if norm_flagged == norm_ov:
+            return True
+            
+        # Special case for SLI nested itemized overrides resolving gross/net weight and financial anomalies
+        if norm_flagged == "grossweight" and "gross" in ov_field.lower() and "items_" in ov_field.lower():
+            return True
+        if norm_flagged == "netweight" and "net" in ov_field.lower() and "items_" in ov_field.lower():
+            return True
+        if norm_flagged in ["total", "amount", "value", "totalamount", "totalvalue"] and "value" in ov_field.lower() and "items_" in ov_field.lower():
+            return True
+            
+    return False
+
+def is_anomaly_resolved_live(shipment_id, flagged_field):
+    """
+    Live Python Cross-Validation Engine.
+    Evaluates whether a flagged anomaly is truly resolved by re-checking resolved data across documents.
+    Returns: '✅ Resolved', '❌ Unresolved', or '⚠️ Typo / Mismatch Introduced'
+    """
+    overrides_df = fetch_all_overrides()
+    shipment_overrides = overrides_df[overrides_df['shipment_id'] == shipment_id] if not overrides_df.empty else pd.DataFrame()
+    has_overrides = not shipment_overrides.empty
+
+    norm_flagged = normalize_field_name(flagged_field)
+
+    # 1. Financial Total Mismatch Check
+    if norm_flagged in ["totalamount", "totalvalue", "total", "amount", "value"]:
+        civ_data = fetch_resolved_document_data(shipment_id, "CIV")
+        sli_data = fetch_resolved_document_data(shipment_id, "SLI")
+        
+        if civ_data and sli_data:
+            civ_val = float(civ_data.get("total_amount", 0.0) or 0.0)
+            sli_val = float(sli_data.get("total_value_usd", 0.0) or 0.0)
+            sli_items = ensure_list(sli_data.get("items"))
+            if sli_items:
+                item_sum = sum(float(it.get("value_usd", 0.0) or 0.0) for it in sli_items if isinstance(it, dict))
+                if item_sum > 0:
+                    sli_val = item_sum
+                    
+            if abs(civ_val - sli_val) <= 0.05 and civ_val > 0:
+                return "✅ Resolved" if has_overrides else "✅ Passed"
+            else:
+                return "⚠️ Typo / Mismatch Introduced" if has_overrides else "❌ Unresolved"
+
+    # 2. Gross Weight Mismatch Check
+    if "gross" in norm_flagged:
+        weights = []
+        for dt in ["PKL", "SLI", "VGM"]:
+            d = fetch_resolved_document_data(shipment_id, dt)
+            if d:
+                gw = float(d.get("gross_weight_kg", 0.0) or 0.0)
+                if dt == "SLI":
+                    items_list = ensure_list(d.get("items"))
+                    if items_list:
+                        item_gw = sum(float(it.get("gross_weight_kg", 0.0) or 0.0) for it in items_list if isinstance(it, dict))
+                        if item_gw > 0:
+                            gw = item_gw
+                if gw > 0:
+                    weights.append(gw)
+        if len(weights) >= 2:
+            if max(weights) - min(weights) <= 0.05 and min(weights) > 0:
+                return "✅ Resolved" if has_overrides else "✅ Passed"
+            else:
+                return "⚠️ Typo / Mismatch Introduced" if has_overrides else "❌ Unresolved"
+
+    # 3. Net Weight Mismatch Check
+    if "net" in norm_flagged:
+        nets = []
+        for dt in ["PKL", "SLI"]:
+            d = fetch_resolved_document_data(shipment_id, dt)
+            if d:
+                nw = float(d.get("net_weight_kg", 0.0) or 0.0)
+                if dt == "SLI":
+                    items_list = ensure_list(d.get("items"))
+                    if items_list:
+                        item_nw = sum(float(it.get("net_weight_kg", 0.0) or 0.0) for it in items_list if isinstance(it, dict))
+                        if item_nw > 0:
+                            nw = item_nw
+                if nw > 0:
+                    nets.append(nw)
+        if len(nets) >= 2:
+            if max(nets) - min(nets) <= 0.05 and min(nets) > 0:
+                return "✅ Resolved" if has_overrides else "✅ Passed"
+            else:
+                return "⚠️ Typo / Mismatch Introduced" if has_overrides else "❌ Unresolved"
+
+    # Fallback to override presence if specific rule doesn't apply
+    if is_anomaly_resolved(flagged_field, shipment_overrides):
+        return "✅ Resolved"
+    return "❌ Unresolved"
 
 def is_field_in_doc(field, doc_type):
     if doc_type == "CIV":
@@ -259,7 +402,21 @@ def save_overrides(shipment_id, doc_type, overrides_dict):
     orig_data = fetch_document_data(shipment_id, doc_type)
     
     for field, val in overrides_dict.items():
-        orig_val_str = str(orig_data.get(field, ""))
+        if field.startswith("items_"):
+            parts = field.split("_")
+            orig_val_str = ""
+            try:
+                array_idx = int(parts[1])
+                items_list = ensure_list(orig_data.get("items"))
+                if array_idx < len(items_list) and isinstance(items_list[array_idx], dict):
+                    orig_sub_val = items_list[array_idx].get(sub_field)
+                    orig_val_str = str(orig_sub_val) if orig_sub_val is not None and not pd.isna(orig_sub_val) else ""
+            except Exception:
+                orig_val_str = ""
+        else:
+            orig_val = orig_data.get(field)
+            orig_val_str = str(orig_val) if orig_val is not None and not pd.isna(orig_val) else ""
+        
         
         insert_query = """
         INSERT INTO `it-ai-briggs-agentspace.logistics_dataset.Audited_Overrides_Tbl`
@@ -382,11 +539,15 @@ if not anomalies_df.empty:
             continue
             
         shipment_overrides = overrides_df[overrides_df['shipment_id'] == sid]
-        # Check if all anomalies are covered by overrides
-        anomaly_fields = set(shipment_anoms['field_flagged'].unique())
-        override_fields = set(shipment_overrides['field_name'].unique())
-        
-        if anomaly_fields.issubset(override_fields):
+        # Check if all anomalies are covered by overrides (using normalized name matching)
+        all_resolved = True
+        for anom_field in shipment_anoms['field_flagged'].unique():
+            status_res = is_anomaly_resolved_live(sid, anom_field)
+            if status_res not in ["✅ Resolved", "✅ Passed"]:
+                all_resolved = False
+                break
+                
+        if all_resolved:
             resolved_shipment_ids.add(sid)
         else:
             failed_shipment_ids.add(sid)
@@ -473,6 +634,10 @@ if st.session_state.current_view == 'master':
             selected_row_idx = event.selection.rows[0]
             selected_row = filtered_df.iloc[selected_row_idx]
             st.session_state.selected_shipment = selected_row['shipment_id']
+            # Clear form widget state to ensure clean defaults for the newly selected shipment
+            for key in list(st.session_state.keys()):
+                if key.startswith("input_"):
+                    del st.session_state[key]
             st.session_state.current_view = 'detail'
             st.rerun()
     else:
@@ -484,6 +649,9 @@ elif st.session_state.current_view == 'detail':
     if st.button("⬅ Back to Master Queue"):
         st.session_state.current_view = 'master'
         st.session_state.selected_shipment = None
+        for key in list(st.session_state.keys()):
+            if key.startswith("input_"):
+                del st.session_state[key]
         st.rerun()
         
     st.divider()
@@ -583,9 +751,7 @@ elif st.session_state.current_view == 'detail':
         if not shipment_anomalies.empty:
             def get_anomaly_status(row):
                 field = row['field_flagged']
-                if not shipment_overrides.empty and field in shipment_overrides['field_name'].values:
-                    return "✅ Resolved"
-                return "❌ Unresolved"
+                return is_anomaly_resolved_live(selected_shipment, field)
                 
             shipment_anomalies['Status'] = shipment_anomalies.apply(get_anomaly_status, axis=1)
             
@@ -657,12 +823,7 @@ elif st.session_state.current_view == 'detail':
                             all_new_values[dt]['total_value_usd'] = st.number_input(label, value=val, step=100.0, format="%.2f", key=f"input_{dt}_total_value_usd")
                             
                             # 2. Package Line items
-                            items_list = resolved_data.get("items", [])
-                            if hasattr(items_list, "tolist"):
-                                items_list = items_list.tolist()
-                            elif not isinstance(items_list, list):
-                                items_list = list(items_list)
-                                
+                            items_list = ensure_list(resolved_data.get("items"))
                             if items_list:
                                 st.write("**Package Line Items weights & values:**")
                                 for idx, item in enumerate(items_list):
@@ -716,6 +877,11 @@ elif st.session_state.current_view == 'detail':
                                 calc_net = sum(float(val) for f, val in new_vals.items() if f.startswith("items_") and f.endswith("_net_weight_kg"))
                                 new_vals['gross_weight_kg'] = calc_gross
                                 new_vals['net_weight_kg'] = calc_net
+                                
+                                # Automatically calculate root-level grand financial value by summing line item values
+                                if any(f.startswith("items_") and f.endswith("_value_usd") for f in new_vals.keys()):
+                                    calc_val = sum(float(val) for f, val in new_vals.items() if f.startswith("items_") and f.endswith("_value_usd"))
+                                    new_vals['total_value_usd'] = calc_val
                             
                             # Check if anything changed
                             has_changes = False
@@ -727,26 +893,24 @@ elif st.session_state.current_view == 'detail':
                                     try:
                                         array_idx = int(parts[1])
                                         sub_field = "_".join(parts[2:])
-                                        items_list = orig_vals.get("items", [])
-                                        if hasattr(items_list, "tolist"):
-                                            items_list = items_list.tolist()
-                                        
+                                        items_list = ensure_list(orig_vals.get("items"))
                                         orig_sub_val = None
-                                        if array_idx < len(items_list):
+                                        if array_idx < len(items_list) and isinstance(items_list[array_idx], dict):
                                             orig_sub_val = items_list[array_idx].get(sub_field)
                                             
-                                        if str(orig_sub_val) != str(val):
+                                        if is_value_changed(orig_sub_val, val):
                                             has_changes = True
                                             changed_values[f] = val
                                     except Exception:
                                         pass
                                 else:
                                     # Standard scalar field
-                                    if str(orig_vals.get(f)) != str(val):
+                                    if is_value_changed(orig_vals.get(f), val):
                                         has_changes = True
                                         changed_values[f] = val
                                     
                             if has_changes:
+                                t_start = time.time()
                                 # Save overrides to BigQuery
                                 success = save_overrides(selected_shipment, dt, changed_values)
                                 if success:
@@ -755,11 +919,14 @@ elif st.session_state.current_view == 'detail':
                                     original_blob = document_map[dt]['original']
                                     if original_blob:
                                         try:
+                                            t0 = time.time()
                                             # Fetch raw original data for text coordinate matching
                                             original_data = fetch_document_data(selected_shipment, dt)
                                             # Download template background
                                             original_pdf_bytes = original_blob.download_as_bytes()
+                                            t_dl = time.time() - t0
                                             
+                                            t1 = time.time()
                                             # Render and redact direct in-place PDF
                                             pdf_bytes = generate_audited_pdf(
                                                 selected_shipment,
@@ -768,6 +935,7 @@ elif st.session_state.current_view == 'detail':
                                                 original_data,
                                                 original_pdf_bytes
                                             )
+                                            t_gen = time.time() - t1
                                             
                                             original_name = original_blob.name
                                             if "_audited" in original_name.lower():
@@ -775,11 +943,16 @@ elif st.session_state.current_view == 'detail':
                                             else:
                                                 target_name = original_name[:-4] + "_audited.pdf"
                                                 
+                                            t2 = time.time()
                                             bucket = gcs_client.bucket(bucket_name)
                                             blob = bucket.blob(target_name)
                                             blob.upload_from_string(pdf_bytes, content_type="application/pdf")
+                                            t_ul = time.time() - t2
                                             
-                                            modified_docs.append(dt)
+                                            elapsed = time.time() - t_start
+                                            print(f"⏱️ [{dt}] PDF Re-generation completed in {elapsed:.2f}s (Download: {t_dl:.2f}s, Vector Render: {t_gen:.2f}s, GCS Upload: {t_ul:.2f}s)")
+                                            
+                                            modified_docs.append(f"{dt} ({elapsed:.2f}s)")
                                         except Exception as gen_err:
                                             st.error(f"Error during {dt} PDF generation/upload: {gen_err}")
                                     else:
@@ -789,8 +962,11 @@ elif st.session_state.current_view == 'detail':
                                     
                         if modified_docs:
                             st.cache_data.clear()
+                            for key in list(st.session_state.keys()):
+                                if key.startswith("input_"):
+                                    del st.session_state[key]
                             st.success(f"✅ Successfully saved and re-generated PDFs for: {', '.join(modified_docs)}!")
-                            time.sleep(1.5)
+                            time.sleep(1.0)
                             st.rerun()
                         else:
                             st.info("No modifications detected. No documents needed re-generation.")
@@ -833,10 +1009,14 @@ elif st.session_state.current_view == 'detail':
                                             except Exception:
                                                 pass
                                                 
-                                        # Clear cache and reload
+                                        # Clear cache, widget session state, and reload
                                         st.cache_data.clear()
+                                        for key in list(st.session_state.keys()):
+                                            if key.startswith(f"input_{dt}_"):
+                                                del st.session_state[key]
+                                                
                                         st.success(f"✅ Successfully reset {dt} corrections!")
-                                        time.sleep(1.5)
+                                        time.sleep(1.0)
                                         st.rerun()
                                     except Exception as reset_err:
                                         st.error(f"Error resetting {dt} corrections: {reset_err}")

@@ -354,26 +354,3 @@ def pubsub_trigger(cloud_event):
             processed_at=processed_at
         )
     )
-
-# === LOCAL TESTING BYPASS ===
-if __name__ == "__main__":
-    print("Running in local test mode...")
-    
-    test_shipment_id = "10351463"
-    test_processed_at = datetime.now(timezone.utc).isoformat()
-    
-    # Update these URIs to the exact bucket path you verified earlier!
-    test_files = {
-        "CIV": "gs://logistic-audit-pdfs/shipment_10351463/CIV_10351463.pdf",
-        "PKL": "gs://logistic-audit-pdfs/shipment_10351463/PKL_10351463.pdf",
-        "SLI": "gs://logistic-audit-pdfs/shipment_10351463/SLI_10351463.pdf",
-        "VGM": "gs://logistic-audit-pdfs/shipment_10351463/VGM_10351463.pdf"
-    }
-    
-    asyncio.run(
-        process_shipment_concurrently(
-            shipment_id=test_shipment_id,
-            document_uris=test_files,
-            processed_at=test_processed_at
-        )
-    )
