@@ -221,23 +221,49 @@ if 'current_view' not in st.session_state:
     st.session_state.current_view = 'master'
 if 'selected_shipment' not in st.session_state:
     st.session_state.selected_shipment = None
+if 'processed_at_sort' not in st.session_state:
+    st.session_state.processed_at_sort = None  # None, 'asc', or 'desc'
 
 # Routing Logic
 if st.session_state.current_view == 'master':
     st.subheader("Master Audit Queue")
     
-    st.markdown("##### Filter Shipments")
-    filter_col1, filter_col2 = st.columns(2)
+    st.markdown("##### Filter & Sort Shipments")
+    filter_col1, filter_col2, filter_col3 = st.columns([2, 2, 1.5])
     with filter_col1:
         search_term = st.text_input("Search by Shipment ID", "")
     with filter_col2:
         status_filter = st.multiselect("Filter by Status", ["Passed", "Failed"], default=["Passed", "Failed"])
+    with filter_col3:
+        sort_state = st.session_state.processed_at_sort
+        if sort_state == 'asc':
+            sort_btn_label = "Processed At 🔼 (Asc)"
+        elif sort_state == 'desc':
+            sort_btn_label = "Processed At 🔽 (Desc)"
+        else:
+            sort_btn_label = "Processed At ↕️ (Default)"
         
+        st.markdown("<div style='padding-top: 28px;'></div>", unsafe_allow_html=True)
+        if st.button(sort_btn_label, key="sort_processed_at_btn", help="Click to toggle sorting by processed_at date/time (Ascending -> Descending -> Default)"):
+            if st.session_state.processed_at_sort is None:
+                st.session_state.processed_at_sort = 'asc'
+            elif st.session_state.processed_at_sort == 'asc':
+                st.session_state.processed_at_sort = 'desc'
+            else:
+                st.session_state.processed_at_sort = None
+            st.rerun()
+
     if not queue_df.empty:
         filtered_df = queue_df[
             (queue_df['shipment_id'].astype(str).str.contains(search_term, case=False, na=False)) &
             (queue_df['Status'].isin(status_filter))
         ]
+        
+        # Apply processed_at date/time sorting if toggled
+        if st.session_state.processed_at_sort == 'asc':
+            filtered_df = filtered_df.sort_values(by='processed_at', ascending=True, na_position='last')
+        elif st.session_state.processed_at_sort == 'desc':
+            filtered_df = filtered_df.sort_values(by='processed_at', ascending=False, na_position='last')
     else:
         filtered_df = pd.DataFrame()
 
