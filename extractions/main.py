@@ -1,6 +1,7 @@
 import asyncio
 import json
 import base64
+import time
 import functions_framework
 from google.cloud import bigquery
 from google import genai
@@ -24,6 +25,7 @@ MODEL_ID = "gemini-2.5-pro"
 civ_schema = {
     "type": "OBJECT",
     "properties": {
+        "currency": {"type": "STRING"},
         "total_amount": {"type": "NUMBER"},
         "items": {
             "type": "ARRAY",
@@ -54,6 +56,7 @@ pkl_schema = {
 sli_schema = {
     "type": "OBJECT",
     "properties": {
+        "currency": {"type": "STRING"},
         "items": {
             "type": "ARRAY",
             "items": {
@@ -112,7 +115,8 @@ async def process_shipment_concurrently(shipment_id: str, document_uris: dict, p
     
     prompts = {
         "CIV": (
-            "Analyze the attached Commercial Invoice. Extract the 'TOTAL AMOUNT.'"
+            "Analyze the attached Commercial Invoice. Extract the 'TOTAL AMOUNT.' "
+            "Also identify the 3-letter currency code for the amounts (e.g., 'USD', 'EUR', 'CAD', 'MXN', 'GBP', 'JPY'). Output 'USD' if standard dollar symbols or USD are indicated. "
             "Additionally, find the list under the column 'PART NUMBER DESCRIPTION'. Extract a complete list of all items, providing both the material number and its corresponding 'HTS' number for each."
         ),
         "PKL": (
@@ -123,7 +127,8 @@ async def process_shipment_concurrently(shipment_id: str, document_uris: dict, p
         "SLI": (
             "Analyze the attached Shipper's Letter of Instructions (SLI)."
             "First, find the columns titled 'Gross Weight in KG' and 'Net Weight in KG' and sum them to extract root 'gross_weight_kg' and 'net_weight_kg' totals (or extract the printed totals if explicitly shown)."
-            "Find the section containing 'Value in USD' and extract the grand total value as 'total_value_usd'."
+            "Find the section containing 'Value in USD' and extract the grand total value as 'total_value_usd'. "
+            "Also identify the 3-letter currency code (e.g., 'USD', 'EUR', 'CAD', 'MXN', 'GBP', 'JPY'). Output 'USD' if standard dollar symbols or USD are indicated. "
             "Next, extract each individual package line item in the 'items' array, providing its corresponding 'value_usd', 'gross_weight_kg', and 'net_weight_kg' individually."
         ),
         "VGM": (
@@ -181,18 +186,27 @@ async def process_shipment_concurrently(shipment_id: str, document_uris: dict, p
             print(f"Inserting {doc_type} data into {table_id} using Load Job...")
             
             job_config = bigquery.LoadJobConfig(
-                source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+                source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON
             )
             
-            # Execute the load job
-            load_job = bq_client.load_table_from_json(
-                [row_data], 
-                table_id, 
-                job_config=job_config
-            )
-            
-            # .result() forces the script to wait until the data is fully written and queryable
-            load_job.result() 
+            # Helper for retrying BigQuery operations when rate limits are encountered
+            def run_load():
+                return bq_client.load_table_from_json([row_data], table_id, job_config=job_config)
+
+            # Retry up to 5 times with backoff if rate limits occur
+            for attempt in range(5):
+                try:
+                    load_job = run_load()
+                    load_job.result()
+                    break
+                except Exception as ex:
+                    if ("rateLimitExceeded" in str(ex) or "403" in str(ex)) and attempt < 4:
+                        sleep_s = (attempt + 1) * 3
+                        print(f"[{doc_type}] BigQuery rate limit hit. Retrying in {sleep_s}s (Attempt {attempt + 1}/5)...")
+                        time.sleep(sleep_s)
+                    else:
+                        raise ex
+
             print(f"[{doc_type}] Successfully loaded into BigQuery.")
                 
         except json.JSONDecodeError as e:
@@ -212,12 +226,14 @@ async def process_shipment_concurrently(shipment_id: str, document_uris: dict, p
         QUALIFY RANK() OVER(PARTITION BY shipment_id ORDER BY processed_at DESC) = 1
     ),
     LatestCIVBase AS (
-        SELECT * FROM `it-ai-briggs-agentspace.logistics_dataset.CIV_Tbl`
+        SELECT *, LOWER(COALESCE(currency, 'usd')) AS norm_currency 
+        FROM `it-ai-briggs-agentspace.logistics_dataset.CIV_Tbl`
         WHERE shipment_id = '{shipment_id}'
         QUALIFY RANK() OVER(PARTITION BY shipment_id ORDER BY processed_at DESC) = 1
     ),
     LatestSLI AS (
-        SELECT * FROM `it-ai-briggs-agentspace.logistics_dataset.SLI_Tbl`
+        SELECT *, LOWER(COALESCE(currency, 'usd')) AS norm_currency 
+        FROM `it-ai-briggs-agentspace.logistics_dataset.SLI_Tbl`
         WHERE shipment_id = '{shipment_id}'
         QUALIFY RANK() OVER(PARTITION BY shipment_id ORDER BY processed_at DESC) = 1
     ),
@@ -243,12 +259,13 @@ async def process_shipment_concurrently(shipment_id: str, document_uris: dict, p
     AggregatedCIVs AS (
         SELECT 
             shipment_id,
-            SUM(total_amount) AS combined_total_amount
+            SUM(total_amount) AS combined_total_amount,
+            MAX(norm_currency) AS norm_currency
         FROM LatestCIVBase
         GROUP BY shipment_id
     )
 
-    -- Financial Discrepancies
+    -- Financial Discrepancies (Only flagged for USD shipments; foreign currencies bypass)
     SELECT 
         c.shipment_id,
         CAST('{processed_at}' AS TIMESTAMP) AS processed_at,
@@ -260,6 +277,7 @@ async def process_shipment_concurrently(shipment_id: str, document_uris: dict, p
     JOIN LatestSLI s 
         ON c.shipment_id = s.shipment_id
     WHERE ROUND(c.combined_total_amount) != ROUND(s.total_value_usd)
+      AND (c.norm_currency IN ('usd', '$') AND s.norm_currency IN ('usd', '$'))
 
     UNION ALL
 
@@ -322,12 +340,20 @@ async def process_shipment_concurrently(shipment_id: str, document_uris: dict, p
     WHERE c.material_number IS NULL;
     """
 
-    try:
-        query_job = bq_client.query(audit_query)
-        query_job.result()  # Waits for the query job to finish
-        print(f"[{shipment_id}] Audit engine complete! Shipment_Anomalies_Tbl has been updated for batch {processed_at}.")
-    except Exception as e:
-        print(f"[{shipment_id}] CRITICAL ERROR: Failed to run audit query: {e}")
+    for attempt in range(5):
+        try:
+            query_job = bq_client.query(audit_query)
+            query_job.result()  # Waits for the query job to finish
+            print(f"[{shipment_id}] Audit engine complete! Shipment_Anomalies_Tbl has been updated for batch {processed_at}.")
+            break
+        except Exception as e:
+            if ("rateLimitExceeded" in str(e) or "403" in str(e)) and attempt < 4:
+                sleep_s = (attempt + 1) * 3
+                print(f"[{shipment_id}] Audit query rate limit hit. Retrying in {sleep_s}s (Attempt {attempt + 1}/5)...")
+                time.sleep(sleep_s)
+            else:
+                print(f"[{shipment_id}] CRITICAL ERROR: Failed to run audit query: {e}")
+                break
 
 
 # GCP Cloud Function Entry Point

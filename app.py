@@ -100,6 +100,353 @@ def fetch_anomalies():
         st.error(f"Error fetching anomalies: {e}")
         return pd.DataFrame()
 
+@st.cache_data(ttl=15)
+def fetch_all_overrides():
+    if not client:
+        return pd.DataFrame()
+    query = """
+    SELECT shipment_id, document_type, field_name, original_value, audited_value
+    FROM `it-ai-briggs-agentspace.logistics_dataset.Audited_Overrides_Tbl`
+    """
+    try:
+        return client.query(query).to_dataframe()
+    except Exception as e:
+        st.error(f"Error fetching overrides: {e}")
+        return pd.DataFrame()
+
+def fetch_document_data(shipment_id, doc_type):
+    if not client:
+        return {}
+    table_map = {
+        "CIV": "CIV_Tbl",
+        "PKL": "PKL_Tbl",
+        "SLI": "SLI_Tbl",
+        "VGM": "VGM_Tbl"
+    }
+    table_name = table_map.get(doc_type)
+    if not table_name:
+        return {}
+    query = f"""
+    SELECT * FROM `it-ai-briggs-agentspace.logistics_dataset.{table_name}`
+    WHERE shipment_id = @shipment_id
+    ORDER BY processed_at DESC
+    LIMIT 1
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("shipment_id", "STRING", shipment_id)
+        ]
+    )
+    try:
+        df = client.query(query, job_config=job_config).to_dataframe()
+        if not df.empty:
+            return df.iloc[0].to_dict()
+    except Exception as e:
+        st.error(f"Error fetching original {doc_type} data: {e}")
+    return {}
+
+def ensure_list(val):
+    if val is None:
+        return []
+    if hasattr(val, "tolist"):
+        try:
+            return val.tolist()
+        except Exception:
+            pass
+    if isinstance(val, list):
+        return val
+    try:
+        return list(val)
+    except Exception:
+        return []
+
+def fetch_resolved_document_data(shipment_id, doc_type):
+    # 1. Fetch original raw data
+    data = fetch_document_data(shipment_id, doc_type)
+    if not data:
+        return {}
+    
+    if "items" in data:
+        data["items"] = ensure_list(data["items"])
+
+    # 2. Fetch overrides for this shipment and doc_type
+    if not client:
+        return data
+        
+    query = """
+    SELECT field_name, audited_value
+    FROM `it-ai-briggs-agentspace.logistics_dataset.Audited_Overrides_Tbl`
+    WHERE shipment_id = @shipment_id AND document_type = @doc_type
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("shipment_id", "STRING", shipment_id),
+            bigquery.ScalarQueryParameter("doc_type", "STRING", doc_type)
+        ]
+    )
+    try:
+        df = client.query(query, job_config=job_config).to_dataframe()
+        for idx, row in df.iterrows():
+            field = row['field_name']
+            val_str = row['audited_value']
+            
+            # Cast back to the original field's type if possible
+            if field in data:
+                orig_val = data[field]
+                try:
+                    if isinstance(orig_val, float):
+                        data[field] = float(val_str)
+                    elif isinstance(orig_val, int):
+                        data[field] = int(float(val_str))
+                    else:
+                        data[field] = val_str
+                except ValueError:
+                    data[field] = val_str
+            elif field.startswith("items_"):
+                # Parse and apply nested array element overrides (e.g. items_0_gross_weight_kg)
+                parts = field.split("_")
+                try:
+                    array_idx = int(parts[1])
+                    sub_field = "_".join(parts[2:])
+                    items_list = ensure_list(data.get("items"))
+                    if array_idx < len(items_list) and isinstance(items_list[array_idx], dict):
+                        orig_val = items_list[array_idx].get(sub_field)
+                        try:
+                            if isinstance(orig_val, float):
+                                items_list[array_idx][sub_field] = float(val_str)
+                            elif isinstance(orig_val, int):
+                                items_list[array_idx][sub_field] = int(float(val_str))
+                            else:
+                                items_list[array_idx][sub_field] = val_str
+                        except ValueError:
+                            items_list[array_idx][sub_field] = val_str
+                    data["items"] = items_list
+                except Exception:
+                    pass
+    except Exception as e:
+        st.error(f"Error fetching overrides for {doc_type}: {e}")
+        
+    if doc_type == "SLI" and "items" in data:
+        items_list = ensure_list(data["items"])
+        if items_list:
+            val_sum = sum(float(it.get("value_usd", 0.0) or 0.0) for it in items_list if isinstance(it, dict))
+            if val_sum > 0:
+                data["total_value_usd"] = val_sum
+            gw_sum = sum(float(it.get("gross_weight_kg", 0.0) or 0.0) for it in items_list if isinstance(it, dict))
+            if gw_sum > 0:
+                data["gross_weight_kg"] = gw_sum
+            nw_sum = sum(float(it.get("net_weight_kg", 0.0) or 0.0) for it in items_list if isinstance(it, dict))
+            if nw_sum > 0:
+                data["net_weight_kg"] = nw_sum
+
+    return data
+
+def is_value_changed(val1, val2):
+    if val1 is None or val2 is None:
+        return val1 != val2
+    try:
+        # Check mathematically with a 0.05 float tolerance to absorb minor extraction rounding/formatting differences
+        return abs(float(val1) - float(val2)) > 0.05
+    except (ValueError, TypeError):
+        return str(val1).strip() != str(val2).strip()
+
+def normalize_field_name(name):
+    if not name:
+        return ""
+    n = name.lower()
+    for term in ['_', '(', ')', 'kg', 'lb', 'usd', 'amount', 'value']:
+        n = n.replace(term, " ")
+    words = [w.strip() for w in n.split() if w.strip()]
+    return "".join(words)
+
+def is_anomaly_resolved(flagged_field, shipment_overrides):
+    if shipment_overrides.empty:
+        return False
+        
+    norm_flagged = normalize_field_name(flagged_field)
+    
+    for ov_field in shipment_overrides['field_name'].values:
+        norm_ov = normalize_field_name(ov_field)
+        if norm_flagged == norm_ov:
+            return True
+            
+        # Special case for SLI nested itemized overrides resolving gross/net weight and financial anomalies
+        if norm_flagged == "grossweight" and "gross" in ov_field.lower() and "items_" in ov_field.lower():
+            return True
+        if norm_flagged == "netweight" and "net" in ov_field.lower() and "items_" in ov_field.lower():
+            return True
+        if norm_flagged in ["total", "amount", "value", "totalamount", "totalvalue"] and "value" in ov_field.lower() and "items_" in ov_field.lower():
+            return True
+            
+    return False
+
+def is_anomaly_resolved_live(shipment_id, flagged_field):
+    """
+    Live Python Cross-Validation Engine.
+    Evaluates whether a flagged anomaly is truly resolved by re-checking resolved data across documents.
+    Returns: '✅ Resolved', '❌ Unresolved', or '⚠️ Typo / Mismatch Introduced'
+    """
+    overrides_df = fetch_all_overrides()
+    shipment_overrides = overrides_df[overrides_df['shipment_id'] == shipment_id] if not overrides_df.empty else pd.DataFrame()
+    has_overrides = not shipment_overrides.empty
+
+    norm_flagged = normalize_field_name(flagged_field)
+
+    # 1. Financial Total Mismatch Check
+    if norm_flagged in ["totalamount", "totalvalue", "total", "amount", "value"]:
+        civ_data = fetch_resolved_document_data(shipment_id, "CIV")
+        sli_data = fetch_resolved_document_data(shipment_id, "SLI")
+        
+        if civ_data and sli_data:
+            # Check for foreign currency — bypass financial mismatch check if non-USD
+            civ_curr = str(civ_data.get("currency", "USD") or "USD").upper().strip()
+            sli_curr = str(sli_data.get("currency", "USD") or "USD").upper().strip()
+            if civ_curr not in ["USD", "$"] or sli_curr not in ["USD", "$"]:
+                return "✅ Passed (Foreign Currency)"
+
+            civ_val = float(civ_data.get("total_amount", 0.0) or 0.0)
+            sli_val = float(sli_data.get("total_value_usd", 0.0) or 0.0)
+            sli_items = ensure_list(sli_data.get("items"))
+            if sli_items:
+                item_sum = sum(float(it.get("value_usd", 0.0) or 0.0) for it in sli_items if isinstance(it, dict))
+                if item_sum > 0:
+                    sli_val = item_sum
+                    
+            if abs(civ_val - sli_val) <= 0.05 and civ_val > 0:
+                return "✅ Resolved" if has_overrides else "✅ Passed"
+            else:
+                return "⚠️ Typo / Mismatch Introduced" if has_overrides else "❌ Unresolved"
+
+    # 2. Gross Weight Mismatch Check
+    if "gross" in norm_flagged:
+        weights = []
+        for dt in ["PKL", "SLI", "VGM"]:
+            d = fetch_resolved_document_data(shipment_id, dt)
+            if d:
+                gw = float(d.get("gross_weight_kg", 0.0) or 0.0)
+                if dt == "SLI":
+                    items_list = ensure_list(d.get("items"))
+                    if items_list:
+                        item_gw = sum(float(it.get("gross_weight_kg", 0.0) or 0.0) for it in items_list if isinstance(it, dict))
+                        if item_gw > 0:
+                            gw = item_gw
+                if gw > 0:
+                    weights.append(gw)
+        if len(weights) >= 2:
+            if max(weights) - min(weights) <= 0.05 and min(weights) > 0:
+                return "✅ Resolved" if has_overrides else "✅ Passed"
+            else:
+                return "⚠️ Typo / Mismatch Introduced" if has_overrides else "❌ Unresolved"
+
+    # 3. Net Weight Mismatch Check
+    if "net" in norm_flagged:
+        nets = []
+        for dt in ["PKL", "SLI"]:
+            d = fetch_resolved_document_data(shipment_id, dt)
+            if d:
+                nw = float(d.get("net_weight_kg", 0.0) or 0.0)
+                if dt == "SLI":
+                    items_list = ensure_list(d.get("items"))
+                    if items_list:
+                        item_nw = sum(float(it.get("net_weight_kg", 0.0) or 0.0) for it in items_list if isinstance(it, dict))
+                        if item_nw > 0:
+                            nw = item_nw
+                if nw > 0:
+                    nets.append(nw)
+        if len(nets) >= 2:
+            if max(nets) - min(nets) <= 0.05 and min(nets) > 0:
+                return "✅ Resolved" if has_overrides else "✅ Passed"
+            else:
+                return "⚠️ Typo / Mismatch Introduced" if has_overrides else "❌ Unresolved"
+
+    # Fallback to override presence if specific rule doesn't apply
+    if is_anomaly_resolved(flagged_field, shipment_overrides):
+        return "✅ Resolved"
+    return "❌ Unresolved"
+
+def is_field_in_doc(field, doc_type):
+    if doc_type == "CIV":
+        return field in ['total_amount']
+    elif doc_type == "PKL":
+        return field in ['gross_weight_lb', 'gross_weight_kg', 'net_weight_lb', 'net_weight_kg', 'pallet_count', 'loose_case_count']
+    elif doc_type == "SLI":
+        return field in ['total_value_usd', 'gross_weight_kg', 'net_weight_kg', 'Gross Weight (KG)', 'Net Weight (KG)', 'Total Amount']
+    elif doc_type == "VGM":
+        return field in ['gross_weight_lb', 'gross_weight_kg']
+    return False
+
+def save_overrides(shipment_id, doc_type, overrides_dict):
+    if not client:
+        return False
+        
+    fields = list(overrides_dict.keys())
+    if not fields:
+        return True
+        
+    # Clear previous overrides for these fields to avoid duplication
+    for field, val in overrides_dict.items():
+        delete_query = """
+        DELETE FROM `it-ai-briggs-agentspace.logistics_dataset.Audited_Overrides_Tbl`
+        WHERE shipment_id = @shipment_id AND document_type = @doc_type AND field_name = @field
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("shipment_id", "STRING", shipment_id),
+                bigquery.ScalarQueryParameter("doc_type", "STRING", doc_type),
+                bigquery.ScalarQueryParameter("field", "STRING", field)
+            ]
+        )
+        try:
+            client.query(delete_query, job_config=job_config).result()
+        except Exception as e:
+            st.error(f"Error clearing previous overrides: {e}")
+            return False
+
+    # Insert new override rows via standard transactional DML queries (bypasses streaming buffer)
+    orig_data = fetch_document_data(shipment_id, doc_type)
+    
+    for field, val in overrides_dict.items():
+        if field.startswith("items_"):
+            parts = field.split("_")
+            orig_val_str = ""
+            try:
+                array_idx = int(parts[1])
+                items_list = ensure_list(orig_data.get("items"))
+                if array_idx < len(items_list) and isinstance(items_list[array_idx], dict):
+                    orig_sub_val = items_list[array_idx].get(sub_field)
+                    orig_val_str = str(orig_sub_val) if orig_sub_val is not None and not pd.isna(orig_sub_val) else ""
+            except Exception:
+                orig_val_str = ""
+        else:
+            orig_val = orig_data.get(field)
+            orig_val_str = str(orig_val) if orig_val is not None and not pd.isna(orig_val) else ""
+        
+        
+        insert_query = """
+        INSERT INTO `it-ai-briggs-agentspace.logistics_dataset.Audited_Overrides_Tbl`
+        (shipment_id, document_type, field_name, original_value, audited_value, updated_at)
+        VALUES
+        (@shipment_id, @doc_type, @field, @orig_val, @audited_val, @updated_at)
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("shipment_id", "STRING", shipment_id),
+                bigquery.ScalarQueryParameter("doc_type", "STRING", doc_type),
+                bigquery.ScalarQueryParameter("field", "STRING", field),
+                bigquery.ScalarQueryParameter("orig_val", "STRING", orig_val_str),
+                bigquery.ScalarQueryParameter("audited_val", "STRING", str(val)),
+                bigquery.ScalarQueryParameter("updated_at", "TIMESTAMP", datetime.datetime.now(datetime.timezone.utc))
+            ]
+        )
+        try:
+            client.query(insert_query, job_config=job_config).result()
+        except Exception as e:
+            st.error(f"Error inserting override for {field}: {e}")
+            return False
+            
+    return True
+
+
 def trigger_ingestion_pipeline():
     """
     Programmatically triggers the Google Cloud Run Job responsible 
@@ -119,12 +466,31 @@ def trigger_ingestion_pipeline():
 # Main App Layout
 st.title("🚢 Logistics Document Auditing - Master Dashboard")
 
+# Initialize session state for syncing status
+if "is_syncing" not in st.session_state:
+    st.session_state.is_syncing = False
+
+def start_sync():
+    st.session_state.is_syncing = True
+
 # Header Section
 col1, col2 = st.columns([3, 1])
 with col1:
     st.markdown("Monitor and audit cross-validation checks across your shipping documents.")
 with col2:
-    if st.button("🔄 Sync New Documents Now", use_container_width=True, type="primary"):
+    sync_disabled = st.session_state.is_syncing
+    button_label = "⏳ Syncing in progress..." if sync_disabled else "🔄 Sync New Documents Now"
+    st.button(
+        button_label,
+        use_container_width=True,
+        type="primary",
+        disabled=sync_disabled,
+        on_click=start_sync,
+        key="sync_documents_button"
+    )
+
+if st.session_state.is_syncing:
+    try:
         with st.spinner("Pipeline running... This may take a minute depending on document volume."):
             try:
                 trigger_ingestion_pipeline()
@@ -169,7 +535,10 @@ with col2:
         st.cache_data.clear()
         st.success("✅ Sync complete! Reloading dashboard...")
         time.sleep(2)
-        st.rerun()
+    finally:
+        st.session_state.is_syncing = False
+
+    st.rerun()
 
 st.divider()
 
@@ -201,7 +570,20 @@ queue_data = []
 for row in all_shipment_data:
     sid = row['shipment_id']
     status = "Failed" if sid in failed_shipment_ids else "Passed"
-    queue_data.append({"shipment_id": sid, "Status": status, "processed_at": row.get('processed_at')})
+        
+    cats = []
+    if not anomalies_df.empty:
+        shipment_anoms = anomalies_df[anomalies_df['shipment_id'] == sid]
+        if not shipment_anoms.empty and 'discrepancy_category' in shipment_anoms.columns:
+            cats = sorted(list(set(shipment_anoms['discrepancy_category'].dropna().unique())))
+    categories_str = ", ".join(cats) if cats else "None"
+
+    queue_data.append({
+        "shipment_id": sid, 
+        "Status": status, 
+        "Categories": categories_str,
+        "processed_at": row.get('processed_at')
+    })
 
 queue_df = pd.DataFrame(queue_data)
 if not queue_df.empty and 'processed_at' in queue_df.columns:
@@ -229,12 +611,18 @@ if st.session_state.current_view == 'master':
     st.subheader("Master Audit Queue")
     
     st.markdown("##### Filter & Sort Shipments")
-    filter_col1, filter_col2, filter_col3 = st.columns([2, 2, 1.5])
+    filter_col1, filter_col2, filter_col3, filter_col4 = st.columns([2, 2, 2, 1.5])
     with filter_col1:
         search_term = st.text_input("Search by Shipment ID", "")
     with filter_col2:
         status_filter = st.multiselect("Filter by Status", ["Passed", "Failed"], default=["Passed", "Failed"])
     with filter_col3:
+        category_filter = st.multiselect(
+            "Filter by Category", 
+            ["Financial", "Weight", "Material Compliance", "None"], 
+            default=["Financial", "Weight", "Material Compliance", "None"]
+        )
+    with filter_col4:
         sort_state = st.session_state.processed_at_sort
         if sort_state == 'asc':
             sort_btn_label = "Processed At 🔼 (Asc)"
@@ -253,10 +641,19 @@ if st.session_state.current_view == 'master':
                 st.session_state.processed_at_sort = None
             st.rerun()
 
+    def matches_category(cat_str, selected_categories):
+        if not selected_categories:
+            return False
+        if cat_str == "None":
+            return "None" in selected_categories
+        row_cats = [c.strip() for c in str(cat_str).split(",")]
+        return any(c in selected_categories for c in row_cats)
+
     if not queue_df.empty:
         filtered_df = queue_df[
             (queue_df['shipment_id'].astype(str).str.contains(search_term, case=False, na=False)) &
-            (queue_df['Status'].isin(status_filter))
+            (queue_df['Status'].isin(status_filter)) &
+            (queue_df['Categories'].apply(lambda x: matches_category(x, category_filter)))
         ]
         
         # Apply processed_at date/time sorting if toggled
@@ -309,6 +706,15 @@ elif st.session_state.current_view == 'detail':
         processed_at = shipment_info.iloc[0]['processed_at']
         if pd.notnull(processed_at):
             st.caption(f"**Processed At:** {processed_at}")
+
+    # Check for foreign currency banner
+    civ_det_data = fetch_resolved_document_data(selected_shipment, "CIV")
+    sli_det_data = fetch_resolved_document_data(selected_shipment, "SLI")
+    civ_curr = str(civ_det_data.get("currency", "USD") or "USD").upper().strip() if civ_det_data else "USD"
+    sli_curr = str(sli_det_data.get("currency", "USD") or "USD").upper().strip() if sli_det_data else "USD"
+    foreign_curr = civ_curr if civ_curr not in ["USD", "$"] else (sli_curr if sli_curr not in ["USD", "$"] else None)
+    if foreign_curr:
+        st.info(f"💱 **Foreign Currency Detected ({foreign_curr})**: Financial total cross-validation audit is automatically bypassed for this shipment.")
             
     insp_col_left, insp_col_right = st.columns([1, 1])
     
