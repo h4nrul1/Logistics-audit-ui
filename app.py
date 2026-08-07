@@ -449,7 +449,7 @@ def is_anomaly_resolved_live(shipment_id, flagged_field):
                 if gw > 0:
                     weights.append(gw)
         if len(weights) >= 2:
-            if max(weights) - min(weights) <= 0.05 and min(weights) > 0:
+            if max(weights) - min(weights) <= 1.0 and min(weights) > 0:
                 return "✅ Resolved" if has_overrides else "✅ Passed"
             else:
                 return "⚠️ Typo / Mismatch Introduced" if has_overrides else "❌ Unresolved"
@@ -470,7 +470,7 @@ def is_anomaly_resolved_live(shipment_id, flagged_field):
                 if nw > 0:
                     nets.append(nw)
         if len(nets) >= 2:
-            if max(nets) - min(nets) <= 0.05 and min(nets) > 0:
+            if max(nets) - min(nets) <= 1.0 and min(nets) > 0:
                 return "✅ Resolved" if has_overrides else "✅ Passed"
             else:
                 return "⚠️ Typo / Mismatch Introduced" if has_overrides else "❌ Unresolved"
