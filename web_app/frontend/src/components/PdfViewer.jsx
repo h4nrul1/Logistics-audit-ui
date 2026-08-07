@@ -1,35 +1,47 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { FileText, Sparkles, AlertCircle } from "lucide-react";
 import { getPdfStreamUrl } from "../services/api";
 
 export default function PdfViewer({ shipmentId, pdfFiles }) {
-  // Determine available document types
+  // Determine available document types and map original vs audited files specifically per document
   const docMap = {};
-  pdfFiles.forEach(f => {
-    const name = f.name.toLowerCase();
+  (pdfFiles || []).forEach(f => {
+    const filename = (f.name || f.blob_name || "").split('/').pop().toLowerCase();
     let docType = "OTHER";
-    if (name.includes("civ")) docType = "CIV";
-    else if (name.includes("pkl")) docType = "PKL";
-    else if (name.includes("sli")) docType = "SLI";
-    else if (name.includes("vgm")) docType = "VGM";
+    if (filename.startsWith("civ") || filename.includes("_civ") || filename.includes("civ_")) docType = "CIV";
+    else if (filename.startsWith("pkl") || filename.includes("_pkl") || filename.includes("pkl_")) docType = "PKL";
+    else if (filename.startsWith("sli") || filename.includes("_sli") || filename.includes("sli_")) docType = "SLI";
+    else if (filename.startsWith("vgm") || filename.includes("_vgm") || filename.includes("vgm_")) docType = "VGM";
 
     if (!docMap[docType]) {
       docMap[docType] = { original: null, audited: null };
     }
-    if (f.is_audited) {
+    if (f.is_audited || filename.includes("_audited")) {
       docMap[docType].audited = f;
     } else {
       docMap[docType].original = f;
     }
   });
 
-  const availableTypes = Object.keys(docMap).sort((a, b) => {
+  const availableTypes = Object.keys(docMap).filter(t => t !== "OTHER").sort((a, b) => {
     const order = { CIV: 1, PKL: 2, SLI: 3, VGM: 4 };
     return (order[a] || 5) - (order[b] || 5);
   });
 
   const [selectedType, setSelectedType] = useState(availableTypes[0] || "CIV");
   const [version, setVersion] = useState("original"); // 'original' or 'audited'
+
+  const currentDocs = docMap[selectedType] || { original: null, audited: null };
+  const hasAuditedForCurrentDoc = !!currentDocs.audited;
+
+  // Auto-switch to Audited PDF ONLY if the currently selected document type actually has an audited version
+  useEffect(() => {
+    if (hasAuditedForCurrentDoc) {
+      setVersion("audited");
+    } else {
+      setVersion("original");
+    }
+  }, [selectedType, hasAuditedForCurrentDoc]);
 
   if (availableTypes.length === 0) {
     return (
@@ -40,19 +52,7 @@ export default function PdfViewer({ shipmentId, pdfFiles }) {
     );
   }
 
-  const currentDocs = docMap[selectedType] || { original: null, audited: null };
-  const hasAudited = !!currentDocs.audited;
-
-  // Auto-switch to Audited PDF when available
-  React.useEffect(() => {
-    if (hasAudited) {
-      setVersion("audited");
-    } else {
-      setVersion("original");
-    }
-  }, [selectedType, hasAudited]);
-
-  const activeFile = (version === "audited" && hasAudited) ? currentDocs.audited : currentDocs.original;
+  const activeFile = (version === "audited" && hasAuditedForCurrentDoc) ? currentDocs.audited : currentDocs.original;
 
   return (
     <div className="glass-card" style={{ padding: "20px" }}>
@@ -66,12 +66,8 @@ export default function PdfViewer({ shipmentId, pdfFiles }) {
         {availableTypes.map(type => (
           <button
             key={type}
-            onClick={() => {
-              setSelectedType(type);
-              if (!docMap[type].audited && version === "audited") {
-                setVersion("original");
-              }
-            }}
+            type="button"
+            onClick={() => setSelectedType(type)}
             style={{
               padding: "6px 14px",
               borderRadius: "8px",
@@ -85,25 +81,30 @@ export default function PdfViewer({ shipmentId, pdfFiles }) {
             }}
           >
             {type}
+            {docMap[type]?.audited && (
+              <span style={{ marginLeft: "6px", color: "var(--status-passed)", fontSize: "0.7rem" }}>✨</span>
+            )}
           </button>
         ))}
       </div>
 
-      {/* Version Toggle (Original vs Audited) */}
+      {/* Version Header Indicator */}
       <div style={{ marginBottom: "16px", display: "flex", alignItems: "center", justifyContent: "space-between", background: "rgba(0, 0, 0, 0.15)", padding: "8px 12px", borderRadius: "8px" }}>
         <span style={{ fontSize: "0.85rem", color: "var(--text-muted)" }}>
-          {hasAudited ? (
+          {hasAuditedForCurrentDoc ? (
             <span style={{ color: "var(--status-passed)", display: "inline-flex", alignItems: "center", gap: "4px" }}>
-              <Sparkles size={14} /> Audited PDF Available
+              <Sparkles size={14} /> Audited {selectedType} PDF Available
             </span>
           ) : (
-            "Viewing Original PDF"
+            <span>Viewing Original {selectedType} PDF</span>
           )}
         </span>
 
-        {hasAudited && (
+        {/* Toggle buttons show ONLY if current selected document type has an audited PDF */}
+        {hasAuditedForCurrentDoc && (
           <div style={{ display: "flex", gap: "8px" }}>
             <button
+              type="button"
               onClick={() => setVersion("original")}
               style={{
                 padding: "4px 10px",
@@ -119,6 +120,7 @@ export default function PdfViewer({ shipmentId, pdfFiles }) {
               Original PDF
             </button>
             <button
+              type="button"
               onClick={() => setVersion("audited")}
               style={{
                 padding: "4px 10px",
@@ -137,7 +139,7 @@ export default function PdfViewer({ shipmentId, pdfFiles }) {
         )}
       </div>
 
-      {/* PDF Stream Frame (Instant Client Rendering) */}
+      {/* PDF Stream Frame */}
       {activeFile ? (
         <iframe
           key={activeFile.blob_name}
@@ -147,7 +149,7 @@ export default function PdfViewer({ shipmentId, pdfFiles }) {
         />
       ) : (
         <div style={{ padding: "32px", textAlign: "center", color: "var(--text-muted)" }}>
-          No file selected for {selectedType}.
+          No PDF file found for {selectedType}.
         </div>
       )}
     </div>
