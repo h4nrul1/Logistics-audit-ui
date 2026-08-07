@@ -47,8 +47,8 @@ def ensure_list(val):
             return val.tolist()
         except Exception:
             pass
-    if isinstance(val, list):
-        return val
+    if isinstance(val, (list, tuple)):
+        return [ensure_list(i) if (hasattr(i, "tolist") or isinstance(i, (list, tuple))) else i for i in val]
     try:
         return list(val)
     except Exception:
@@ -182,12 +182,18 @@ def fetch_document_raw(shipment_id: str, doc_type: str) -> Dict[str, Any]:
             for k, v in row.items():
                 if isinstance(v, (datetime.datetime, datetime.date)):
                     cleaned[k] = v.isoformat()
-                elif isinstance(v, (list, tuple)):
+                elif hasattr(v, "tolist") or isinstance(v, (list, tuple)):
                     cleaned[k] = ensure_list(v)
-                elif pd.isna(v):
+                elif v is None:
                     cleaned[k] = None
                 else:
-                    cleaned[k] = v
+                    try:
+                        if pd.isna(v):
+                            cleaned[k] = None
+                        else:
+                            cleaned[k] = v
+                    except Exception:
+                        cleaned[k] = v
             return cleaned
     except Exception as e:
         print(f"Error fetching raw {doc_type}: {e}")
@@ -292,7 +298,7 @@ def get_master_queue():
         SELECT shipment_id, processed_at FROM `{PROJECT_ID}.{DATASET_ID}.VGM_Tbl`
     )
     GROUP BY shipment_id
-    ORDER BY MAX(processed_at) DESC
+    ORDER BY processed_at DESC
     """
     try:
         df = bq_client.query(query).to_dataframe()
