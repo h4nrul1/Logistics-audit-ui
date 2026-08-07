@@ -993,6 +993,12 @@ elif st.session_state.current_view == 'detail':
             all_new_values = {}
             all_resolved_data = {}
             
+            # Helper to preserve typed input values across document selection reruns
+            def get_default_input_val(key, default_val):
+                if key not in st.session_state:
+                    st.session_state[key] = default_val
+                return st.session_state[key]
+
             # Start a single global form for saving all corrections at once
             with st.form(key="global_corrections_form"):
                 for dt in editable_types:
@@ -1018,7 +1024,8 @@ elif st.session_state.current_view == 'detail':
                             val = float(resolved_data.get('total_amount', 0.0))
                             is_flagged = not shipment_anomalies.empty and 'total_amount' in shipment_anomalies['field_flagged'].values
                             label = "Total Invoice Amount (USD) ⚠️" if is_flagged else "Total Invoice Amount (USD)"
-                            all_new_values[dt]['total_amount'] = st.number_input(label, value=val, step=100.0, format="%.2f", key=f"input_{dt}_total_amount")
+                            key_name = f"input_{dt}_total_amount"
+                            all_new_values[dt]['total_amount'] = st.number_input(label, value=get_default_input_val(key_name, val), step=100.0, format="%.2f", key=key_name)
                             
                         elif dt == "PKL":
                             for field in ['gross_weight_lb', 'gross_weight_kg', 'net_weight_lb', 'net_weight_kg', 'pallet_count', 'loose_case_count']:
@@ -1026,18 +1033,20 @@ elif st.session_state.current_view == 'detail':
                                 val = 0.0 if pd.isna(val) else float(val)
                                 is_flagged = not shipment_anomalies.empty and field in shipment_anomalies['field_flagged'].values
                                 label = f"{field.replace('_', ' ').title()} ⚠️" if is_flagged else field.replace('_', ' ').title()
+                                key_name = f"input_{dt}_{field}"
                                 
                                 if 'count' in field:
-                                    all_new_values[dt][field] = st.number_input(label, value=int(val), step=1, key=f"input_{dt}_{field}")
+                                    all_new_values[dt][field] = st.number_input(label, value=int(get_default_input_val(key_name, val)), step=1, key=key_name)
                                 else:
-                                    all_new_values[dt][field] = st.number_input(label, value=val, step=10.0, format="%.2f", key=f"input_{dt}_{field}")
+                                    all_new_values[dt][field] = st.number_input(label, value=get_default_input_val(key_name, val), step=10.0, format="%.2f", key=key_name)
                                     
                         elif dt == "SLI":
                             # 1. Total value (USD)
                             val = float(resolved_data.get('total_value_usd', 0.0))
                             is_flagged = not shipment_anomalies.empty and 'Total Amount' in shipment_anomalies['field_flagged'].values
                             label = "Total Value (USD) ⚠️" if is_flagged else "Total Value (USD)"
-                            all_new_values[dt]['total_value_usd'] = st.number_input(label, value=val, step=100.0, format="%.2f", key=f"input_{dt}_total_value_usd")
+                            key_name = f"input_{dt}_total_value_usd"
+                            all_new_values[dt]['total_value_usd'] = st.number_input(label, value=get_default_input_val(key_name, val), step=100.0, format="%.2f", key=key_name)
                             
                             # 2. Package Line items
                             items_list = ensure_list(resolved_data.get("items"))
@@ -1048,22 +1057,25 @@ elif st.session_state.current_view == 'detail':
                                     col1, col2, col3 = st.columns(3)
                                     with col1:
                                         it_val = float(item.get("value_usd", 0.0))
+                                        k1 = f"input_{dt}_items_{idx}_value_usd"
                                         all_new_values[dt][f"items_{idx}_value_usd"] = st.number_input(
-                                            "Value (USD)", value=it_val, step=10.0, format="%.2f", key=f"input_{dt}_items_{idx}_value_usd"
+                                            "Value (USD)", value=get_default_input_val(k1, it_val), step=10.0, format="%.2f", key=k1
                                         )
                                     with col2:
                                         it_gross = float(item.get("gross_weight_kg", 0.0))
                                         is_gross_flagged = not shipment_anomalies.empty and 'Gross Weight (KG)' in shipment_anomalies['field_flagged'].values
                                         label_gross = "Gross Wt (kg) ⚠️" if is_gross_flagged else "Gross Wt (kg)"
+                                        k2 = f"input_{dt}_items_{idx}_gross_weight_kg"
                                         all_new_values[dt][f"items_{idx}_gross_weight_kg"] = st.number_input(
-                                            label_gross, value=it_gross, step=1.0, format="%.1f", key=f"input_{dt}_items_{idx}_gross_weight_kg"
+                                            label_gross, value=get_default_input_val(k2, it_gross), step=1.0, format="%.1f", key=k2
                                         )
                                     with col3:
                                         it_net = float(item.get("net_weight_kg", 0.0))
                                         is_net_flagged = not shipment_anomalies.empty and 'Net Weight (KG)' in shipment_anomalies['field_flagged'].values
                                         label_net = "Net Wt (kg) ⚠️" if is_net_flagged else "Net Wt (kg)"
+                                        k3 = f"input_{dt}_items_{idx}_net_weight_kg"
                                         all_new_values[dt][f"items_{idx}_net_weight_kg"] = st.number_input(
-                                            label_net, value=it_net, step=1.0, format="%.1f", key=f"input_{dt}_items_{idx}_net_weight_kg"
+                                            label_net, value=get_default_input_val(k3, it_net), step=1.0, format="%.1f", key=k3
                                         )
                                 
                         elif dt == "VGM":
@@ -1072,7 +1084,8 @@ elif st.session_state.current_view == 'detail':
                                 val = 0.0 if pd.isna(val) else float(val)
                                 is_flagged = not shipment_anomalies.empty and field in shipment_anomalies['field_flagged'].values
                                 label = f"{field.replace('_', ' ').title()} ⚠️" if is_flagged else field.replace('_', ' ').title()
-                                all_new_values[dt][field] = st.number_input(label, value=val, step=10.0, format="%.2f", key=f"input_{dt}_{field}")
+                                key_name = f"input_{dt}_{field}"
+                                all_new_values[dt][field] = st.number_input(label, value=get_default_input_val(key_name, val), step=10.0, format="%.2f", key=key_name)
                 
                 # Master Save/Regenerate button
                 submit_button = st.form_submit_button(
