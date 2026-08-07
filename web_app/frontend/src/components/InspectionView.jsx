@@ -34,15 +34,14 @@ export default function InspectionView({ shipmentId, onBack }) {
       setIsSaving(true);
       setSaveMessage(null);
       
-      // Calculate diffs
+      // Calculate overrides to save and re-generate
       const overridesToSave = {};
       Object.entries(formState).forEach(([dt, newVals]) => {
-        const origVals = detailData.documents[dt] || {};
         const diffs = {};
 
         Object.entries(newVals).forEach(([k, val]) => {
           if (k === "items") return;
-          if (origVals[k] !== val) {
+          if (val !== undefined && val !== null && val !== "") {
             diffs[k] = val;
           }
         });
@@ -51,8 +50,7 @@ export default function InspectionView({ shipmentId, onBack }) {
           newVals.items.forEach((item, idx) => {
             Object.entries(item).forEach(([subKey, subVal]) => {
               const fieldKey = `items_${idx}_${subKey}`;
-              const origSubVal = origVals.items?.[idx]?.[subKey];
-              if (origSubVal !== subVal) {
+              if (subVal !== undefined && subVal !== null && subVal !== "") {
                 diffs[fieldKey] = subVal;
               }
             });
@@ -65,7 +63,7 @@ export default function InspectionView({ shipmentId, onBack }) {
       });
 
       if (Object.keys(overridesToSave).length === 0) {
-        setSaveMessage("No changes were detected.");
+        setSaveMessage("⚠️ Please enter at least one field value to save & regenerate.");
         setIsSaving(false);
         return;
       }

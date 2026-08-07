@@ -42,6 +42,16 @@ export default function PdfViewer({ shipmentId, pdfFiles }) {
 
   const currentDocs = docMap[selectedType] || { original: null, audited: null };
   const hasAudited = !!currentDocs.audited;
+
+  // Auto-switch to Audited PDF when available
+  React.useEffect(() => {
+    if (hasAudited) {
+      setVersion("audited");
+    } else {
+      setVersion("original");
+    }
+  }, [selectedType, hasAudited]);
+
   const activeFile = (version === "audited" && hasAudited) ? currentDocs.audited : currentDocs.original;
 
   return (
