@@ -484,6 +484,37 @@ def save_shipment_overrides(shipment_id: str, payload: OverridesRequest):
 
     return {"status": "success", "modified_documents": modified_docs}
 
+@app.delete("/api/shipments/{shipment_id}/overrides/{doc_type}")
+def reset_shipment_override(shipment_id: str, doc_type: str):
+    delete_query = f"""
+    DELETE FROM `{PROJECT_ID}.{DATASET_ID}.Audited_Overrides_Tbl`
+    WHERE shipment_id = '{shipment_id}' AND document_type = '{doc_type}'
+    """
+    try:
+        query_job = bq_client.query(delete_query)
+        query_job.result()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"BigQuery Delete Overrides Error: {e}")
+
+    # Delete audited PDF blob from GCS
+    try:
+        prefix = f"shipment_{shipment_id}/"
+        bucket = storage_client.bucket(BUCKET_NAME)
+        blobs = list(bucket.list_blobs(prefix=prefix))
+        for b in blobs:
+            if b.name.lower().endswith('.pdf') and doc_type.lower() in b.name.lower() and "_audited" in b.name.lower():
+                b.delete()
+                print(f"Deleted audited blob: {b.name}")
+    except Exception as e:
+        print(f"Error deleting audited blob for {doc_type}: {e}")
+
+    # Clear server memory caches
+    cache_store["queue"]["data"] = None
+    cache_store["anomalies"]["data"] = None
+    cache_store["indicators"]["data"] = None
+
+    return {"status": "success", "message": f"Reset {doc_type} corrections successfully."}
+
 @app.post("/api/sync")
 def trigger_sync():
     try:

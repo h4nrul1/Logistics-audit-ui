@@ -39,3 +39,14 @@ export async function triggerSync() {
   }
   return res.json();
 }
+
+export async function resetOverrides(shipmentId, docType) {
+  const res = await fetch(`${API_BASE_URL}/shipments/${shipmentId}/overrides/${docType}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Failed to reset ${docType} overrides`);
+  }
+  return res.json();
+}

@@ -3,12 +3,13 @@ import { ArrowLeft, Loader2 } from "lucide-react";
 import PdfViewer from "./PdfViewer";
 import AnomaliesPanel from "./AnomaliesPanel";
 import CorrectionsForm from "./CorrectionsForm";
-import { fetchShipmentDetail, saveOverrides } from "../services/api";
+import { fetchShipmentDetail, saveOverrides, resetOverrides } from "../services/api";
 
 export default function InspectionView({ shipmentId, onBack }) {
   const [loading, setLoading] = useState(true);
   const [detailData, setDetailData] = useState(null);
   const [isSaving, setIsSaving] = useState(false);
+  const [resettingDoc, setResettingDoc] = useState(null);
   const [saveMessage, setSaveMessage] = useState(null);
 
   const loadDetail = async () => {
@@ -28,6 +29,24 @@ export default function InspectionView({ shipmentId, onBack }) {
       loadDetail();
     }
   }, [shipmentId]);
+
+  const handleResetOverride = async (docType) => {
+    if (!window.confirm(`Are you sure you want to reset all audit corrections for ${docType}? This will delete the audited PDF and restore original extracted values.`)) {
+      return;
+    }
+    try {
+      setResettingDoc(docType);
+      setSaveMessage(null);
+      const result = await resetOverrides(shipmentId, docType);
+      setSaveMessage(`✅ ${result.message || `Reset ${docType} corrections successfully.`}`);
+      await loadDetail();
+    } catch (err) {
+      console.error(err);
+      setSaveMessage(`❌ Error resetting ${docType} corrections: ${err.message}`);
+    } finally {
+      setResettingDoc(null);
+    }
+  };
 
   const handleSaveOverrides = async (formState) => {
     try {
@@ -137,8 +156,11 @@ export default function InspectionView({ shipmentId, onBack }) {
           />
           <CorrectionsForm 
             documents={detailData.documents || {}} 
+            pdfFiles={detailData.pdf_files || []}
             onSave={handleSaveOverrides} 
+            onReset={handleResetOverride}
             isSaving={isSaving} 
+            resettingDoc={resettingDoc}
           />
         </div>
       </div>

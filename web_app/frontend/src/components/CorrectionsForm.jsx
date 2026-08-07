@@ -1,9 +1,30 @@
 import React, { useState, useEffect } from "react";
-import { Edit3, Save, CheckCircle, Loader2 } from "lucide-react";
+import { Edit3, Save, CheckCircle, Loader2, RotateCcw } from "lucide-react";
 
-export default function CorrectionsForm({ documents, onSave, isSaving }) {
+export default function CorrectionsForm({ documents, pdfFiles, onSave, onReset, isSaving, resettingDoc }) {
   const [formState, setFormState] = useState({});
   const [openExpanders, setOpenExpanders] = useState({ CIV: true, PKL: true, SLI: true, VGM: true });
+
+  // Calculate which document types have audited PDFs
+  const auditedDocs = [];
+  (pdfFiles || []).forEach(f => {
+    if (f.is_audited || f.name.toLowerCase().includes("_audited")) {
+      const filename = (f.name || f.blob_name || "").split('/').pop().toLowerCase();
+      let dt = "OTHER";
+      if (filename.startsWith("civ") || filename.includes("civ")) dt = "CIV";
+      else if (filename.startsWith("pkl") || filename.includes("pkl")) dt = "PKL";
+      else if (filename.startsWith("sli") || filename.includes("sli")) dt = "SLI";
+      else if (filename.startsWith("vgm") || filename.includes("vgm")) dt = "VGM";
+
+      if (dt !== "OTHER" && !auditedDocs.includes(dt)) {
+        auditedDocs.push(dt);
+      }
+    }
+  });
+  auditedDocs.sort((a, b) => {
+    const order = { CIV: 1, PKL: 2, SLI: 3, VGM: 4 };
+    return (order[a] || 5) - (order[b] || 5);
+  });
 
   // Initialize form state from documents prop
   useEffect(() => {
@@ -51,13 +72,10 @@ export default function CorrectionsForm({ documents, onSave, isSaving }) {
 
   return (
     <div className="glass-card" style={{ padding: "20px" }}>
-      <h3 style={{ fontSize: "1.1rem", marginBottom: "8px", display: "flex", alignItems: "center", gap: "8px" }}>
+      <h3 style={{ fontSize: "1.1rem", marginBottom: "16px", display: "flex", alignItems: "center", gap: "8px" }}>
         <Edit3 size={18} color="var(--accent-primary)" />
-        <span>✏️ Auditor Corrections & Re-generation</span>
+        <span>✍️ Auditor Overrides & Correction Entry</span>
       </h3>
-      <p style={{ fontSize: "0.82rem", color: "var(--text-muted)", marginBottom: "16px" }}>
-        Type overrides below. All changes persist instantly across document view switches.
-      </p>
 
       <form onSubmit={handleSubmit}>
         {/* CIV Section */}
@@ -73,7 +91,7 @@ export default function CorrectionsForm({ documents, onSave, isSaving }) {
             </button>
             {openExpanders.CIV && (
               <div style={{ padding: "14px" }}>
-                <label style={{ display: "block", fontSize: "0.82rem", color: "var(--text-muted)", marginBottom: "4px" }}>Total Invoice Amount (USD):</label>
+                <label style={{ display: "block", fontSize: "0.82rem", color: "var(--text-muted)", marginBottom: "4px" }}>Total Amount (USD):</label>
                 <input
                   type="number"
                   step="0.01"
@@ -136,6 +154,26 @@ export default function CorrectionsForm({ documents, onSave, isSaving }) {
                     step="0.1"
                     value={formState.PKL?.net_weight_kg ?? ""}
                     onChange={e => handleScalarChange("PKL", "net_weight_kg", parseFloat(e.target.value) || 0)}
+                    style={{ width: "100%" }}
+                  />
+                </div>
+                <div>
+                  <label style={{ display: "block", fontSize: "0.8rem", color: "var(--text-muted)", marginBottom: "2px" }}>Pallet Count:</label>
+                  <input
+                    type="number"
+                    step="1"
+                    value={formState.PKL?.pallet_count ?? ""}
+                    onChange={e => handleScalarChange("PKL", "pallet_count", parseInt(e.target.value, 10) || 0)}
+                    style={{ width: "100%" }}
+                  />
+                </div>
+                <div>
+                  <label style={{ display: "block", fontSize: "0.8rem", color: "var(--text-muted)", marginBottom: "2px" }}>Loose Case Count:</label>
+                  <input
+                    type="number"
+                    step="1"
+                    value={formState.PKL?.loose_case_count ?? ""}
+                    onChange={e => handleScalarChange("PKL", "loose_case_count", parseInt(e.target.value, 10) || 0)}
                     style={{ width: "100%" }}
                   />
                 </div>
@@ -268,6 +306,52 @@ export default function CorrectionsForm({ documents, onSave, isSaving }) {
             </>
           )}
         </button>
+
+        {/* Reset Corrections Section (Dedicated Reset button for each document type that was audited) */}
+        {auditedDocs.length > 0 && (
+          <div style={{ marginTop: "24px", paddingTop: "16px", borderTop: "1px solid var(--bg-card-border)" }}>
+            <h4 style={{ fontSize: "0.95rem", fontWeight: "600", marginBottom: "12px", display: "flex", alignItems: "center", gap: "6px", color: "var(--text-muted)" }}>
+              <RotateCcw size={16} /> 🗑️ Reset Audit Corrections
+            </h4>
+            <div style={{ display: "grid", gridTemplateColumns: `repeat(${Math.min(auditedDocs.length, 4)}, 1fr)`, gap: "8px" }}>
+              {auditedDocs.map(dt => (
+                <button
+                  key={dt}
+                  type="button"
+                  onClick={() => onReset(dt)}
+                  disabled={resettingDoc === dt}
+                  style={{
+                    padding: "8px 12px",
+                    borderRadius: "8px",
+                    border: "1px solid var(--status-failed)",
+                    background: resettingDoc === dt ? "rgba(239, 68, 68, 0.15)" : "transparent",
+                    color: "var(--status-failed)",
+                    fontWeight: "600",
+                    fontSize: "0.82rem",
+                    cursor: resettingDoc === dt ? "not-allowed" : "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    gap: "6px",
+                    transition: "var(--transition-fast)"
+                  }}
+                >
+                  {resettingDoc === dt ? (
+                    <>
+                      <Loader2 size={14} className="spin-icon" />
+                      <span>Resetting...</span>
+                    </>
+                  ) : (
+                    <>
+                      <RotateCcw size={14} />
+                      <span>Reset {dt}</span>
+                    </>
+                  )}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
       </form>
     </div>
   );
