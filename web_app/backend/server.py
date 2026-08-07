@@ -456,14 +456,21 @@ def save_shipment_overrides(shipment_id: str, payload: OverridesRequest):
                 blobs = list(bucket.list_blobs(prefix=prefix))
                 target_blob = None
                 for b in blobs:
-                    if b.name.lower().endswith('.pdf') and doc_type.lower() in b.name.lower():
+                    if b.name.lower().endswith('.pdf') and doc_type.lower() in b.name.lower() and "_audited" not in b.name.lower():
                         target_blob = b
                         break
 
                 if target_blob:
-                    pdf_bytes = target_blob.download_as_bytes()
+                    original_pdf_bytes = target_blob.download_as_bytes()
+                    original_data = fetch_document_raw(shipment_id, doc_type)
                     audited_data = fetch_resolved_document_data(shipment_id, doc_type)
-                    new_pdf_bytes = pdf_generator.generate_audited_pdf(doc_type, audited_data, pdf_bytes)
+                    new_pdf_bytes = pdf_generator.generate_audited_pdf(
+                        shipment_id,
+                        doc_type,
+                        audited_data,
+                        original_data,
+                        original_pdf_bytes
+                    )
                     if new_pdf_bytes:
                         orig_name = target_blob.name
                         audited_name = orig_name if "_audited" in orig_name.lower() else (orig_name[:-4] + "_audited.pdf")
@@ -472,6 +479,8 @@ def save_shipment_overrides(shipment_id: str, payload: OverridesRequest):
                         modified_docs.append(doc_type)
             except Exception as e:
                 print(f"PDF Gen Error for {doc_type}: {e}")
+                import traceback
+                traceback.print_exc()
 
     return {"status": "success", "modified_documents": modified_docs}
 
