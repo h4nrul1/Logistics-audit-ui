@@ -445,9 +445,11 @@ def save_shipment_overrides(shipment_id: str, payload: OverridesRequest):
 
         if insert_rows:
             table_id = f"{PROJECT_ID}.{DATASET_ID}.Audited_Overrides_Tbl"
-            errors = bq_client.insert_rows_json(table_id, insert_rows)
-            if errors:
-                raise HTTPException(status_code=500, detail=f"BigQuery Insert Overrides Error: {errors}")
+            try:
+                load_job = bq_client.load_table_from_json(insert_rows, table_id)
+                load_job.result()
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"BigQuery Insert Overrides Load Job Error: {e}")
 
         if pdf_generator and hasattr(pdf_generator, 'generate_audited_pdf'):
             try:
@@ -486,15 +488,26 @@ def save_shipment_overrides(shipment_id: str, payload: OverridesRequest):
 
 @app.delete("/api/shipments/{shipment_id}/overrides/{doc_type}")
 def reset_shipment_override(shipment_id: str, doc_type: str):
+    table_id = f"{PROJECT_ID}.{DATASET_ID}.Audited_Overrides_Tbl"
     delete_query = f"""
-    DELETE FROM `{PROJECT_ID}.{DATASET_ID}.Audited_Overrides_Tbl`
+    DELETE FROM `{table_id}`
     WHERE shipment_id = '{shipment_id}' AND document_type = '{doc_type}'
     """
     try:
         query_job = bq_client.query(delete_query)
         query_job.result()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"BigQuery Delete Overrides Error: {e}")
+        if "streaming buffer" in str(e).lower():
+            try:
+                # Streaming buffer fallback: Select non-deleted rows into dataframe and overwrite table using batch Load Job
+                select_query = f"SELECT * FROM `{table_id}` WHERE NOT (shipment_id = '{shipment_id}' AND document_type = '{doc_type}')"
+                df = bq_client.query(select_query).to_dataframe()
+                job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
+                bq_client.load_table_from_dataframe(df, table_id, job_config=job_config).result()
+            except Exception as inner_e:
+                raise HTTPException(status_code=500, detail=f"BigQuery Delete Fallback Error: {inner_e}")
+        else:
+            raise HTTPException(status_code=500, detail=f"BigQuery Delete Overrides Error: {e}")
 
     # Delete audited PDF blob from GCS
     try:
