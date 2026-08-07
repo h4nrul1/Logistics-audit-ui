@@ -33,7 +33,9 @@ civ_schema = {
                 "type": "OBJECT",
                 "properties": {
                     "material_number": {"type": "STRING"},
-                    "hts_code": {"type": "STRING"}
+                    "hts_code": {"type": "STRING"},
+                    "unit_price": {"type": "NUMBER"},
+                    "total_value": {"type": "NUMBER"}
                 }
             }
         }
@@ -117,7 +119,7 @@ async def process_shipment_concurrently(shipment_id: str, document_uris: dict, p
         "CIV": (
             "Analyze the attached Commercial Invoice. Extract the 'TOTAL AMOUNT.' "
             "Also identify the 3-letter currency code for the amounts (e.g., 'USD', 'EUR', 'CAD', 'MXN', 'GBP', 'JPY'). Output 'USD' if standard dollar symbols or USD are indicated. "
-            "Additionally, find the list under the column 'PART NUMBER DESCRIPTION'. Extract a complete list of all items, providing both the material number and its corresponding 'HTS' number for each."
+            "Additionally, find the list under the column 'PART NUMBER DESCRIPTION'. Extract a complete list of all items, providing the material number, its corresponding 'HTS' number, unit price, and total line value for each item."
         ),
         "PKL": (
             "Analyze the attached Packing List. Extract the value for '** Gross Weight' and '** Net Weight' in both pounds (LB) and kilogran(KG)."
@@ -186,7 +188,8 @@ async def process_shipment_concurrently(shipment_id: str, document_uris: dict, p
             print(f"Inserting {doc_type} data into {table_id} using Load Job...")
             
             job_config = bigquery.LoadJobConfig(
-                source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON
+                source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+                schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION]
             )
             
             # Helper for retrying BigQuery operations when rate limits are encountered

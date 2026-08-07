@@ -241,6 +241,107 @@ def fetch_resolved_document_data(shipment_id, doc_type):
 
     return data
 
+@st.cache_data(ttl=30)
+def fetch_all_shipment_indicators():
+    """
+    Fetches foreign currencies and $0 item counts for ALL shipments in a single fast BigQuery query.
+    Returns: { shipment_id: {"currency": str, "zero_count": int, "hts_groups": dict} }
+    """
+    client = get_bq_client()
+    if not client:
+        return {}
+        
+    query = """
+    WITH Currencies AS (
+        SELECT shipment_id, UPPER(TRIM(currency)) AS currency FROM `it-ai-briggs-agentspace.logistics_dataset.CIV_Tbl` WHERE currency IS NOT NULL
+        UNION ALL
+        SELECT shipment_id, UPPER(TRIM(currency)) AS currency FROM `it-ai-briggs-agentspace.logistics_dataset.SLI_Tbl` WHERE currency IS NOT NULL
+    ),
+    NormalizedCurrencies AS (
+        SELECT shipment_id, ARRAY_AGG(currency ORDER BY currency LIMIT 1)[OFFSET(0)] AS currency
+        FROM Currencies
+        WHERE currency NOT IN ('USD', '$', '')
+        GROUP BY shipment_id
+    ),
+    CivItems AS (
+        SELECT 
+            shipment_id,
+            COALESCE(item.material_number, 'Unknown Material') AS material,
+            COALESCE(item.hts_code, 'Unassigned HTS') AS hts_code,
+            COALESCE(item.total_value, item.unit_price) AS val
+        FROM `it-ai-briggs-agentspace.logistics_dataset.CIV_Tbl`,
+        UNNEST(items) AS item
+    ),
+    SliItems AS (
+        SELECT 
+            shipment_id,
+            'Unknown Material' AS material,
+            'Unassigned HTS' AS hts_code,
+            item.value_usd AS val
+        FROM `it-ai-briggs-agentspace.logistics_dataset.SLI_Tbl`,
+        UNNEST(items) AS item
+    ),
+    AllZeroItems AS (
+        SELECT shipment_id, material, hts_code FROM CivItems WHERE val = 0.0
+        UNION ALL
+        SELECT shipment_id, material, hts_code FROM SliItems WHERE val = 0.0 AND shipment_id NOT IN (SELECT shipment_id FROM CivItems WHERE val = 0.0)
+    ),
+    ZeroBreakdown AS (
+        SELECT shipment_id, hts_code, COUNT(*) as zero_count, STRING_AGG(DISTINCT material, ', ') as materials
+        FROM AllZeroItems
+        GROUP BY shipment_id, hts_code
+    )
+    SELECT 
+        COALESCE(z.shipment_id, c.shipment_id) AS shipment_id,
+        c.currency,
+        z.hts_code,
+        z.zero_count,
+        z.materials
+    FROM ZeroBreakdown z
+    FULL OUTER JOIN NormalizedCurrencies c ON z.shipment_id = c.shipment_id
+    """
+    try:
+        df = client.query(query).to_dataframe()
+        indicators_map = {}
+        for sid, group in df.groupby("shipment_id"):
+            currency = None
+            curr_series = group["currency"].dropna()
+            if not curr_series.empty:
+                currency = curr_series.iloc[0]
+
+            hts_groups = {}
+            total_zero = 0
+            for _, row in group.iterrows():
+                if pd.notna(row["hts_code"]):
+                    hts = row["hts_code"]
+                    cnt = int(row["zero_count"])
+                    total_zero += cnt
+                    mats = [m.strip() for m in str(row["materials"]).split(",") if m.strip()]
+                    hts_groups[hts] = {"count": cnt, "materials": mats}
+
+            indicators_map[sid] = {
+                "currency": currency,
+                "zero_count": total_zero,
+                "hts_groups": hts_groups
+            }
+        return indicators_map
+    except Exception as e:
+        return {}
+
+def get_shipment_indicators(shipment_id):
+    all_map = fetch_all_shipment_indicators()
+    data = all_map.get(shipment_id, {"currency": None, "zero_count": 0, "hts_groups": {}})
+    
+    parts = []
+    if data["currency"]:
+        parts.append(f"💱 {data['currency']}")
+    if data["zero_count"] > 0:
+        cnt = data["zero_count"]
+        parts.append(f"🏷️ {cnt} ($0 item)" if cnt == 1 else f"🏷️ {cnt} ($0 items)")
+        
+    indicator_str = " | ".join(parts) if parts else "None"
+    return indicator_str, data["zero_count"], data["hts_groups"]
+
 def is_value_changed(val1, val2):
     if val1 is None or val2 is None:
         return val1 != val2
@@ -578,10 +679,13 @@ for row in all_shipment_data:
             cats = sorted(list(set(shipment_anoms['discrepancy_category'].dropna().unique())))
     categories_str = ", ".join(cats) if cats else "None"
 
+    indicator_str, _, _ = get_shipment_indicators(sid)
+
     queue_data.append({
         "shipment_id": sid, 
         "Status": status, 
         "Categories": categories_str,
+        "Indicators": indicator_str,
         "processed_at": row.get('processed_at')
     })
 
@@ -715,6 +819,30 @@ elif st.session_state.current_view == 'detail':
     foreign_curr = civ_curr if civ_curr not in ["USD", "$"] else (sli_curr if sli_curr not in ["USD", "$"] else None)
     if foreign_curr:
         st.info(f"💱 **Foreign Currency Detected ({foreign_curr})**: Financial total cross-validation audit is automatically bypassed for this shipment.")
+
+    # Check for $0 items callout & HTS code breakdown table
+    _, zero_count, hts_groups = get_shipment_indicators(selected_shipment)
+    if zero_count > 0:
+        st.warning(f"🏷️ **$0 Priced Items Detected**: Found **{zero_count}** item(s) valued at $0.00 across **{len(hts_groups)}** HTS code(s).")
+        
+        hts_table_rows = []
+        for hts_code, info in sorted(hts_groups.items()):
+            mats_str = ", ".join(info["materials"]) if info["materials"] else "N/A"
+            hts_table_rows.append({
+                "HTS Code": hts_code,
+                "$0 Item Count": str(info["count"]),
+                "Material / Part Numbers": mats_str
+            })
+            
+        with st.expander("🏷️ View $0 Items Grouped by HTS Code", expanded=True):
+            st.dataframe(
+                pd.DataFrame(hts_table_rows),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "$0 Item Count": st.column_config.Column(alignment="left")
+                }
+            )
             
     insp_col_left, insp_col_right = st.columns([1, 1])
     
