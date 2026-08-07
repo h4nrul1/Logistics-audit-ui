@@ -162,6 +162,21 @@ def ensure_list(val):
     except Exception:
         return []
 
+@st.cache_data(ttl=300)
+def download_pdf_base64(bucket_name, blob_name):
+    client = get_gcs_client()
+    if not client:
+        return None
+    try:
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        pdf_bytes = blob.download_as_bytes()
+        return base64.b64encode(pdf_bytes).decode('utf-8')
+    except Exception as e:
+        st.error(f"Error downloading PDF {blob_name}: {e}")
+        return None
+
+@st.cache_data(ttl=60)
 def fetch_resolved_document_data(shipment_id, doc_type):
     # 1. Fetch original raw data
     data = fetch_document_data(shipment_id, doc_type)
@@ -950,9 +965,8 @@ elif st.session_state.current_view == 'detail':
             selected_blob = doc_versions['audited'] if version_choice == "Audited PDF" else doc_versions['original']
             
             if selected_blob:
-                with st.spinner(f"Loading {selected_blob.name.split('/')[-1]}..."):
-                    pdf_bytes = selected_blob.download_as_bytes()
-                    base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
+                base64_pdf = download_pdf_base64(bucket_name, selected_blob.name)
+                if base64_pdf:
                     pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="600px" type="application/pdf"></iframe>'
                     st.markdown(pdf_display, unsafe_allow_html=True)
             else:
