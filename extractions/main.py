@@ -100,18 +100,28 @@ async def extract_from_document(doc_type: str, uri: str, prompt: str, schema: di
         temperature=0.0  
     )
     
-    # Execute async request
-    response = await client.aio.models.generate_content(
-        model=MODEL_ID,
-        contents=[document_part, prompt],
-        config=config
-    )
-    
+    response = None
+    for attempt in range(5):
+        try:
+            response = await client.aio.models.generate_content(
+                model=MODEL_ID,
+                contents=[document_part, prompt],
+                config=config
+            )
+            break
+        except Exception as e:
+            if attempt < 4:
+                sleep_s = (attempt + 1) * 3
+                print(f"[{doc_type}] Gemini API rate limit/error ({e}). Retrying in {sleep_s}s (Attempt {attempt + 1}/5)...")
+                await asyncio.sleep(sleep_s)
+            else:
+                raise e
+
     print(f"[{doc_type}] Extraction complete.")
     
     return {
         "type": doc_type,
-        "json_data": response.text
+        "json_data": response.text if response else "{}"
     }
 
 async def process_shipment_concurrently(shipment_id: str, document_uris: dict, processed_at: str):
