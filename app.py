@@ -243,6 +243,106 @@ def fetch_resolved_document_data(shipment_id, doc_type):
 
     return data
 
+@st.cache_data(ttl=30)
+def fetch_all_shipment_indicators():
+    """
+    Fetches foreign currencies and $0 item counts for ALL shipments in a single fast BigQuery query.
+    Returns: { shipment_id: {"currency": str, "zero_count": int, "hts_groups": dict} }
+    """
+    client = get_bq_client()
+    if not client:
+        return {}
+        
+    query = """
+    WITH Currencies AS (
+        SELECT shipment_id, UPPER(TRIM(currency)) AS currency FROM `it-ai-briggs-agentspace.logistics_dataset.CIV_Tbl` WHERE currency IS NOT NULL
+        UNION ALL
+        SELECT shipment_id, UPPER(TRIM(currency)) AS currency FROM `it-ai-briggs-agentspace.logistics_dataset.SLI_Tbl` WHERE currency IS NOT NULL
+    ),
+    NormalizedCurrencies AS (
+        SELECT shipment_id, ARRAY_AGG(currency ORDER BY currency LIMIT 1)[OFFSET(0)] AS currency
+        FROM Currencies
+        WHERE currency NOT IN ('USD', '$', '')
+        GROUP BY shipment_id
+    ),
+    CivItems AS (
+        SELECT 
+            shipment_id,
+            COALESCE(item.material_number, 'Unknown Material') AS material,
+            COALESCE(item.hts_code, 'Unassigned HTS') AS hts_code,
+            COALESCE(item.total_value, item.unit_price) AS val
+        FROM `it-ai-briggs-agentspace.logistics_dataset.CIV_Tbl`,
+        UNNEST(items) AS item
+    ),
+    SliItems AS (
+        SELECT 
+            shipment_id,
+            'Unknown Material' AS material,
+            'Unassigned HTS' AS hts_code,
+            item.value_usd AS val
+        FROM `it-ai-briggs-agentspace.logistics_dataset.SLI_Tbl`,
+        UNNEST(items) AS item
+    ),
+    AllZeroItems AS (
+        SELECT shipment_id, material, hts_code FROM CivItems WHERE val = 0.0
+        UNION ALL
+        SELECT shipment_id, material, hts_code FROM SliItems WHERE val = 0.0 AND shipment_id NOT IN (SELECT shipment_id FROM CivItems WHERE val = 0.0)
+    ),
+    ZeroBreakdown AS (
+        SELECT shipment_id, hts_code, COUNT(*) as zero_count, STRING_AGG(DISTINCT material, ', ') as materials
+        FROM AllZeroItems
+        GROUP BY shipment_id, hts_code
+    )
+    SELECT 
+        COALESCE(z.shipment_id, c.shipment_id) AS shipment_id,
+        c.currency,
+        z.hts_code,
+        z.zero_count,
+        z.materials
+    FROM ZeroBreakdown z
+    FULL OUTER JOIN NormalizedCurrencies c ON z.shipment_id = c.shipment_id
+    """
+    try:
+        df = client.query(query).to_dataframe()
+        indicators_map = {}
+        for sid, group in df.groupby("shipment_id"):
+            currency = None
+            curr_series = group["currency"].dropna()
+            if not curr_series.empty:
+                currency = curr_series.iloc[0]
+
+            hts_groups = {}
+            total_zero = 0
+            for _, row in group.iterrows():
+                if pd.notna(row["hts_code"]):
+                    hts = row["hts_code"]
+                    cnt = int(row["zero_count"])
+                    total_zero += cnt
+                    mats = [m.strip() for m in str(row["materials"]).split(",") if m.strip()]
+                    hts_groups[hts] = {"count": cnt, "materials": mats}
+
+            indicators_map[sid] = {
+                "currency": currency,
+                "zero_count": total_zero,
+                "hts_groups": hts_groups
+            }
+        return indicators_map
+    except Exception as e:
+        return {}
+
+def get_shipment_indicators(shipment_id):
+    all_map = fetch_all_shipment_indicators()
+    data = all_map.get(shipment_id, {"currency": None, "zero_count": 0, "hts_groups": {}})
+    
+    parts = []
+    if data["currency"]:
+        parts.append(f"💱 {data['currency']}")
+    if data["zero_count"] > 0:
+        cnt = data["zero_count"]
+        parts.append(f"🏷️ {cnt} ($0 item)" if cnt == 1 else f"🏷️ {cnt} ($0 items)")
+        
+    indicator_str = " | ".join(parts) if parts else "None"
+    return indicator_str, data["zero_count"], data["hts_groups"]
 def is_value_changed(val1, val2):
     if val1 is None or val2 is None:
         return val1 != val2
@@ -300,6 +400,11 @@ def is_anomaly_resolved_live(shipment_id, flagged_field):
         sli_data = fetch_resolved_document_data(shipment_id, "SLI")
         
         if civ_data and sli_data:
+            # Check for foreign currency — bypass financial mismatch check if non-USD
+            civ_curr = str(civ_data.get("currency", "USD") or "USD").upper().strip()
+            sli_curr = str(sli_data.get("currency", "USD") or "USD").upper().strip()
+            if civ_curr not in ["USD", "$"] or sli_curr not in ["USD", "$"]:
+                return "✅ Passed (Foreign Currency)"
             civ_val = float(civ_data.get("total_amount", 0.0) or 0.0)
             sli_val = float(sli_data.get("total_value_usd", 0.0) or 0.0)
             sli_items = ensure_list(sli_data.get("items"))
@@ -462,12 +567,31 @@ def trigger_ingestion_pipeline():
 # Main App Layout
 st.title("🚢 Logistics Document Auditing - Master Dashboard")
 
+# Initialize session state for syncing status
+if "is_syncing" not in st.session_state:
+    st.session_state.is_syncing = False
+
+def start_sync():
+    st.session_state.is_syncing = True
+
 # Header Section
 col1, col2 = st.columns([3, 1])
 with col1:
     st.markdown("Monitor and audit cross-validation checks across your shipping documents.")
 with col2:
-    if st.button("🔄 Sync New Documents Now", use_container_width=True, type="primary"):
+    sync_disabled = st.session_state.is_syncing
+    button_label = "⏳ Syncing in progress..." if sync_disabled else "🔄 Sync New Documents Now"
+    st.button(
+        button_label,
+        use_container_width=True,
+        type="primary",
+        disabled=sync_disabled,
+        on_click=start_sync,
+        key="sync_documents_button"
+    )
+
+if st.session_state.is_syncing:
+    try:
         with st.spinner("Pipeline running... This may take a minute depending on document volume."):
             try:
                 trigger_ingestion_pipeline()
@@ -512,7 +636,10 @@ with col2:
         st.cache_data.clear()
         st.success("✅ Sync complete! Reloading dashboard...")
         time.sleep(2)
-        st.rerun()
+    finally:
+        st.session_state.is_syncing = False
+
+    st.rerun()
 
 st.divider()
 
@@ -570,7 +697,23 @@ for row in all_shipment_data:
         status = "Resolved"
     else:
         status = "Passed"
-    queue_data.append({"shipment_id": sid, "Status": status, "processed_at": row.get('processed_at')})
+        
+    cats = []
+    if not anomalies_df.empty:
+        shipment_anoms = anomalies_df[anomalies_df['shipment_id'] == sid]
+        if not shipment_anoms.empty and 'discrepancy_category' in shipment_anoms.columns:
+            cats = sorted(list(set(shipment_anoms['discrepancy_category'].dropna().unique())))
+    categories_str = ", ".join(cats) if cats else "None"
+
+    indicator_str, _, _ = get_shipment_indicators(sid)
+
+    queue_data.append({
+        "shipment_id": sid, 
+        "Status": status, 
+        "Categories": categories_str,
+        "Indicators": indicator_str,
+        "processed_at": row.get('processed_at')
+    })
 
 queue_df = pd.DataFrame(queue_data)
 if not queue_df.empty and 'processed_at' in queue_df.columns:
@@ -591,23 +734,64 @@ if 'current_view' not in st.session_state:
     st.session_state.current_view = 'master'
 if 'selected_shipment' not in st.session_state:
     st.session_state.selected_shipment = None
+if 'processed_at_sort' not in st.session_state:
+    st.session_state.processed_at_sort = None  # None, 'asc', or 'desc'
 
 # Routing Logic
 if st.session_state.current_view == 'master':
     st.subheader("Master Audit Queue")
     
-    st.markdown("##### Filter Shipments")
-    filter_col1, filter_col2 = st.columns(2)
+    st.markdown("##### Filter & Sort Shipments")
+    filter_col1, filter_col2, filter_col3, filter_col4 = st.columns([2, 2, 2, 1.5])
     with filter_col1:
         search_term = st.text_input("Search by Shipment ID", "")
     with filter_col2:
         status_filter = st.multiselect("Filter by Status", ["Passed", "Failed", "Resolved"], default=["Passed", "Failed", "Resolved"])
+    with filter_col3:
+        category_filter = st.multiselect(
+            "Filter by Category", 
+            ["Financial", "Weight", "Material Compliance", "None"], 
+            default=["Financial", "Weight", "Material Compliance", "None"]
+        )
+    with filter_col4:
+        sort_state = st.session_state.processed_at_sort
+        if sort_state == 'asc':
+            sort_btn_label = "Processed At 🔼 (Asc)"
+        elif sort_state == 'desc':
+            sort_btn_label = "Processed At 🔽 (Desc)"
+        else:
+            sort_btn_label = "Processed At ↕️ (Default)"
         
+        st.markdown("<div style='padding-top: 28px;'></div>", unsafe_allow_html=True)
+        if st.button(sort_btn_label, key="sort_processed_at_btn", help="Click to toggle sorting by processed_at date/time (Ascending -> Descending -> Default)"):
+            if st.session_state.processed_at_sort is None:
+                st.session_state.processed_at_sort = 'asc'
+            elif st.session_state.processed_at_sort == 'asc':
+                st.session_state.processed_at_sort = 'desc'
+            else:
+                st.session_state.processed_at_sort = None
+            st.rerun()
+
+    def matches_category(cat_str, selected_categories):
+        if not selected_categories:
+            return False
+        if cat_str == "None":
+            return "None" in selected_categories
+        row_cats = [c.strip() for c in str(cat_str).split(",")]
+        return any(c in selected_categories for c in row_cats)
+
     if not queue_df.empty:
         filtered_df = queue_df[
             (queue_df['shipment_id'].astype(str).str.contains(search_term, case=False, na=False)) &
-            (queue_df['Status'].isin(status_filter))
+            (queue_df['Status'].isin(status_filter)) &
+            (queue_df['Categories'].apply(lambda x: matches_category(x, category_filter)))
         ]
+        
+        # Apply processed_at date/time sorting if toggled
+        if st.session_state.processed_at_sort == 'asc':
+            filtered_df = filtered_df.sort_values(by='processed_at', ascending=True, na_position='last')
+        elif st.session_state.processed_at_sort == 'desc':
+            filtered_df = filtered_df.sort_values(by='processed_at', ascending=False, na_position='last')
     else:
         filtered_df = pd.DataFrame()
 
@@ -665,6 +849,39 @@ elif st.session_state.current_view == 'detail':
         processed_at = shipment_info.iloc[0]['processed_at']
         if pd.notnull(processed_at):
             st.caption(f"**Processed At:** {processed_at}")
+
+    # Check for foreign currency banner
+    civ_det_data = fetch_resolved_document_data(selected_shipment, "CIV")
+    sli_det_data = fetch_resolved_document_data(selected_shipment, "SLI")
+    civ_curr = str(civ_det_data.get("currency", "USD") or "USD").upper().strip() if civ_det_data else "USD"
+    sli_curr = str(sli_det_data.get("currency", "USD") or "USD").upper().strip() if sli_det_data else "USD"
+    foreign_curr = civ_curr if civ_curr not in ["USD", "$"] else (sli_curr if sli_curr not in ["USD", "$"] else None)
+    if foreign_curr:
+        st.info(f"💱 **Foreign Currency Detected ({foreign_curr})**: Financial total cross-validation audit is automatically bypassed for this shipment.")
+
+    # Check for $0 items callout & HTS code breakdown table
+    _, zero_count, hts_groups = get_shipment_indicators(selected_shipment)
+    if zero_count > 0:
+        st.warning(f"🏷️ **$0 Priced Items Detected**: Found **{zero_count}** item(s) valued at $0.00 across **{len(hts_groups)}** HTS code(s).")
+        
+        hts_table_rows = []
+        for hts_code, info in sorted(hts_groups.items()):
+            mats_str = ", ".join(info["materials"]) if info["materials"] else "N/A"
+            hts_table_rows.append({
+                "HTS Code": hts_code,
+                "$0 Item Count": str(info["count"]),
+                "Material / Part Numbers": mats_str
+            })
+            
+        with st.expander("🏷️ View $0 Items Grouped by HTS Code", expanded=True):
+            st.dataframe(
+                pd.DataFrame(hts_table_rows),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "$0 Item Count": st.column_config.Column(alignment="left")
+                }
+            )
             
     # 1. Fetch all PDFs and populate document_map upfront
     document_map = {}
