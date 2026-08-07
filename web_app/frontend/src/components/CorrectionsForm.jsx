@@ -211,6 +211,44 @@ export default function CorrectionsForm({ documents, onSave, isSaving }) {
           </div>
         )}
 
+        {/* VGM Section */}
+        {documents.VGM && (
+          <div style={{ marginBottom: "12px", border: "1px solid var(--bg-card-border)", borderRadius: "8px", overflow: "hidden" }}>
+            <button
+              type="button"
+              onClick={() => toggleExpander("VGM")}
+              style={{ width: "100%", padding: "10px 14px", background: "rgba(0,0,0,0.2)", border: "none", color: "var(--text-main)", fontWeight: "600", fontSize: "0.9rem", textAlign: "left", cursor: "pointer", display: "flex", justifyContent: "space-between" }}
+            >
+              <span>📝 VGM Corrections</span>
+              <span>{openExpanders.VGM ? "▲" : "▼"}</span>
+            </button>
+            {openExpanders.VGM && (
+              <div style={{ padding: "14px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
+                <div>
+                  <label style={{ display: "block", fontSize: "0.8rem", color: "var(--text-muted)", marginBottom: "2px" }}>Gross Wt (lb):</label>
+                  <input
+                    type="number"
+                    step="0.1"
+                    value={formState.VGM?.gross_weight_lb ?? ""}
+                    onChange={e => handleScalarChange("VGM", "gross_weight_lb", parseFloat(e.target.value) || 0)}
+                    style={{ width: "100%" }}
+                  />
+                </div>
+                <div>
+                  <label style={{ display: "block", fontSize: "0.8rem", color: "var(--text-muted)", marginBottom: "2px" }}>Gross Wt (kg):</label>
+                  <input
+                    type="number"
+                    step="0.1"
+                    value={formState.VGM?.gross_weight_kg ?? ""}
+                    onChange={e => handleScalarChange("VGM", "gross_weight_kg", parseFloat(e.target.value) || 0)}
+                    style={{ width: "100%" }}
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Submit Button */}
         <button
           type="submit"
