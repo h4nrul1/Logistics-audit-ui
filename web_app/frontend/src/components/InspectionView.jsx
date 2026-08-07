@@ -48,28 +48,47 @@ export default function InspectionView({ shipmentId, onBack }) {
     }
   };
 
+  const isValDifferent = (val1, val2) => {
+    if (val1 === undefined || val1 === null) val1 = "";
+    if (val2 === undefined || val2 === null) val2 = "";
+    if (val1 === "" && val2 === "") return false;
+    
+    // Numeric comparison
+    const n1 = Number(val1);
+    const n2 = Number(val2);
+    if (!isNaN(n1) && !isNaN(n2) && String(val1).trim() !== "" && String(val2).trim() !== "") {
+      return Math.abs(n1 - n2) > 0.0001;
+    }
+    
+    return String(val1).trim() !== String(val2).trim();
+  };
+
   const handleSaveOverrides = async (formState) => {
     try {
       setIsSaving(true);
       setSaveMessage(null);
       
-      // Calculate overrides to save and re-generate
+      // Calculate diffs relative to currently loaded document values
       const overridesToSave = {};
       Object.entries(formState).forEach(([dt, newVals]) => {
+        const origVals = detailData?.documents?.[dt] || {};
         const diffs = {};
 
         Object.entries(newVals).forEach(([k, val]) => {
           if (k === "items") return;
-          if (val !== undefined && val !== null && val !== "") {
+          const origVal = origVals[k];
+          if (isValDifferent(val, origVal)) {
             diffs[k] = val;
           }
         });
 
         if (Array.isArray(newVals.items)) {
           newVals.items.forEach((item, idx) => {
+            const origItem = origVals.items?.[idx] || {};
             Object.entries(item).forEach(([subKey, subVal]) => {
               const fieldKey = `items_${idx}_${subKey}`;
-              if (subVal !== undefined && subVal !== null && subVal !== "") {
+              const origSubVal = origItem[subKey];
+              if (isValDifferent(subVal, origSubVal)) {
                 diffs[fieldKey] = subVal;
               }
             });
@@ -82,7 +101,7 @@ export default function InspectionView({ shipmentId, onBack }) {
       });
 
       if (Object.keys(overridesToSave).length === 0) {
-        setSaveMessage("⚠️ Please enter at least one field value to save & regenerate.");
+        setSaveMessage("ℹ️ No changes were detected in any form fields.");
         setIsSaving(false);
         return;
       }
