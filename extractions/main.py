@@ -97,18 +97,28 @@ async def extract_from_document(doc_type: str, uri: str, prompt: str, schema: di
         temperature=0.0  
     )
     
-    # Execute async request
-    response = await client.aio.models.generate_content(
-        model=MODEL_ID,
-        contents=[document_part, prompt],
-        config=config
-    )
-    
+    response = None
+    for attempt in range(5):
+        try:
+            response = await client.aio.models.generate_content(
+                model=MODEL_ID,
+                contents=[document_part, prompt],
+                config=config
+            )
+            break
+        except Exception as e:
+            if attempt < 4:
+                sleep_s = (attempt + 1) * 3
+                print(f"[{doc_type}] Gemini API rate limit/error ({e}). Retrying in {sleep_s}s (Attempt {attempt + 1}/5)...")
+                await asyncio.sleep(sleep_s)
+            else:
+                raise e
+
     print(f"[{doc_type}] Extraction complete.")
     
     return {
         "type": doc_type,
-        "json_data": response.text
+        "json_data": response.text if response else "{}"
     }
 
 async def process_shipment_concurrently(shipment_id: str, document_uris: dict, processed_at: str):
@@ -117,9 +127,10 @@ async def process_shipment_concurrently(shipment_id: str, document_uris: dict, p
     
     prompts = {
         "CIV": (
-            "Analyze the attached Commercial Invoice. Extract the 'TOTAL AMOUNT.' "
+            "Analyze the attached Commercial Invoice document. Note that this PDF may contain one or multiple combined invoices. "
+            "If there are multiple invoices in this single PDF, sum the 'TOTAL AMOUNT' of all invoices together to extract the single overall grand total 'total_amount' across the entire document. "
             "Also identify the 3-letter currency code for the amounts (e.g., 'USD', 'EUR', 'CAD', 'MXN', 'GBP', 'JPY'). Output 'USD' if standard dollar symbols or USD are indicated. "
-            "Additionally, find the list under the column 'PART NUMBER DESCRIPTION'. Extract a complete list of all items, providing the material number, its corresponding 'HTS' number, unit price, and total line value for each item."
+            "Additionally, find all items across all invoice pages under the column 'PART NUMBER DESCRIPTION'. Extract a complete list of all items across all invoices in the PDF, providing the material number, its corresponding 'HTS' number, unit price, and total line value for each item."
         ),
         "PKL": (
             "Analyze the attached Packing List. Extract the value for '** Gross Weight' and '** Net Weight' in both pounds (LB) and kilogran(KG)."
