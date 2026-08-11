@@ -125,7 +125,7 @@ def reprocess_all_shipments():
         except Exception as e:
             print(f"[{shipment_id}] Failed to publish event: {e}")
             
-        time.sleep(2)
+        time.sleep(2.5)
 
     print("\n--- All past shipments queued for re-extraction with original timestamps preserved! ---")
 

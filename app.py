@@ -38,6 +38,14 @@ except Exception as e:
     st.error(f"Failed to initialize GCS client: {e}")
     gcs_client = None
 
+@st.cache_data(ttl=600)
+def download_pdf_bytes_cached(bucket_name, blob_name):
+    if not gcs_client:
+        return None
+    bucket = gcs_client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    return blob.download_as_bytes()
+
 # Data Fetching Functions
 @st.cache_data(ttl=60)
 def fetch_all_shipments():
@@ -114,6 +122,7 @@ def fetch_all_overrides():
         st.error(f"Error fetching overrides: {e}")
         return pd.DataFrame()
 
+@st.cache_data(ttl=300)
 def fetch_document_data(shipment_id, doc_type):
     if not client:
         return {}
@@ -160,6 +169,7 @@ def ensure_list(val):
     except Exception:
         return []
 
+@st.cache_data(ttl=300)
 def fetch_resolved_document_data(shipment_id, doc_type):
     # 1. Fetch original raw data
     data = fetch_document_data(shipment_id, doc_type)
@@ -413,7 +423,7 @@ def is_anomaly_resolved_live(shipment_id, flagged_field):
                 if item_sum > 0:
                     sli_val = item_sum
                     
-            if abs(civ_val - sli_val) <= 0.05 and civ_val > 0:
+            if abs(civ_val - sli_val) <= 1.00 and civ_val > 0:
                 return "✅ Resolved" if has_overrides else "✅ Passed"
             else:
                 return "⚠️ Typo / Mismatch Introduced" if has_overrides else "❌ Unresolved"
@@ -434,7 +444,7 @@ def is_anomaly_resolved_live(shipment_id, flagged_field):
                 if gw > 0:
                     weights.append(gw)
         if len(weights) >= 2:
-            if max(weights) - min(weights) <= 0.05 and min(weights) > 0:
+            if max(weights) - min(weights) <= 1.00 and min(weights) > 0:
                 return "✅ Resolved" if has_overrides else "✅ Passed"
             else:
                 return "⚠️ Typo / Mismatch Introduced" if has_overrides else "❌ Unresolved"
@@ -455,7 +465,7 @@ def is_anomaly_resolved_live(shipment_id, flagged_field):
                 if nw > 0:
                     nets.append(nw)
         if len(nets) >= 2:
-            if max(nets) - min(nets) <= 0.05 and min(nets) > 0:
+            if max(nets) - min(nets) <= 1.00 and min(nets) > 0:
                 return "✅ Resolved" if has_overrides else "✅ Passed"
             else:
                 return "⚠️ Typo / Mismatch Introduced" if has_overrides else "❌ Unresolved"
@@ -868,10 +878,13 @@ elif st.session_state.current_view == 'detail':
                         selected_blob = next(b for b in pdf_blobs if b.name.endswith(selected_name))
                         
                     with st.spinner(f"Loading {selected_blob.name.split('/')[-1]}..."):
-                        pdf_bytes = selected_blob.download_as_bytes()
-                        base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
-                        pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="600px" type="application/pdf"></iframe>'
-                        st.markdown(pdf_display, unsafe_allow_html=True)
+                        pdf_bytes = download_pdf_bytes_cached(bucket_name, selected_blob.name)
+                        if pdf_bytes:
+                            base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
+                            pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="600px" type="application/pdf"></iframe>'
+                            st.markdown(pdf_display, unsafe_allow_html=True)
+                        else:
+                            st.error("Failed to load PDF bytes from GCS.")
             except Exception as e:
                 st.error(f"Error fetching PDFs from GCS: {e}")
         

@@ -2,7 +2,10 @@ import asyncio
 import json
 import base64
 import time
-import functions_framework
+try:
+    import functions_framework
+except ImportError:
+    functions_framework = None
 from google.cloud import bigquery
 from google import genai
 from google.genai import types
@@ -290,7 +293,7 @@ async def process_shipment_concurrently(shipment_id: str, document_uris: dict, p
     FROM AggregatedCIVs c
     JOIN LatestSLI s 
         ON c.shipment_id = s.shipment_id
-    WHERE ROUND(c.combined_total_amount) != ROUND(s.total_value_usd)
+    WHERE ABS(c.combined_total_amount - s.total_value_usd) > 1.0
       AND (c.norm_currency IN ('usd', '$') AND s.norm_currency IN ('usd', '$'))
 
     UNION ALL
@@ -371,7 +374,6 @@ async def process_shipment_concurrently(shipment_id: str, document_uris: dict, p
 
 
 # GCP Cloud Function Entry Point
-@functions_framework.cloud_event
 def pubsub_trigger(cloud_event):
     try:
         pubsub_message_bytes = base64.b64decode(cloud_event.data["message"]["data"])
@@ -394,6 +396,9 @@ def pubsub_trigger(cloud_event):
             processed_at=processed_at
         )
     )
+
+if functions_framework:
+    pubsub_trigger = functions_framework.cloud_event(pubsub_trigger)
 
 # === LOCAL TESTING BYPASS ===
 if __name__ == "__main__":
