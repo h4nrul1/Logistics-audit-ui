@@ -5,15 +5,20 @@ import time
 import base64
 import datetime
 from typing import Dict, Any, Optional, List
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel
 import pandas as pd
 from google.cloud import bigquery, storage, run_v2
 
-# Add parent directory to sys.path to reuse existing pdf_generator.py if needed
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+# Add directories to sys.path so modules can be imported cleanly
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(BACKEND_DIR))
+if BACKEND_DIR not in sys.path:
+    sys.path.insert(0, BACKEND_DIR)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 try:
     import pdf_generator
@@ -274,7 +279,7 @@ def fetch_resolved_document_data(shipment_id: str, doc_type: str) -> Dict[str, A
     return data
 
 def get_resolved_overrides_set():
-    query = f"SELECT DISTINCT shipment_id FROM `{PROJECT_ID}.{DATASET_ID}.Audited_Overrides_Tbl`"
+    query = f"SELECT DISTINCT shipment_id FROM `{PROJECT_ID}.{DATASET_ID}.Audited_Overrides_Tbl` WHERE document_type = 'COMPLIANCE' AND audited_value = 'Resolved'"
     try:
         df = bq_client.query(query).to_dataframe()
         if not df.empty:
@@ -390,8 +395,43 @@ def get_shipment_detail(shipment_id: str):
     except Exception as e:
         print(f"GCS List Error: {e}")
 
+    # Check for compliance marker or audited field overrides
+    has_compliance_marker = False
+    has_any_overrides = False
+    try:
+        df_comp = bq_client.query(f"SELECT document_type FROM `{PROJECT_ID}.{DATASET_ID}.Audited_Overrides_Tbl` WHERE shipment_id = '{shipment_id}'").to_dataframe()
+        if not df_comp.empty:
+            has_any_overrides = True
+            if "COMPLIANCE" in df_comp['document_type'].values:
+                has_compliance_marker = True
+    except Exception:
+        pass
+
+    has_anomalies = len(shipment_anoms) > 0
+    has_audited_pdfs = any(p.get("is_audited") for p in pdf_files)
+
+    if has_compliance_marker and not has_anomalies:
+        status_str = "Resolved"
+        is_resolved = True
+        is_pending_compliance = False
+    elif has_anomalies:
+        status_str = "Failed"
+        is_resolved = False
+        is_pending_compliance = False
+    elif has_any_overrides or has_audited_pdfs:
+        status_str = "Audited / Pending Compliance"
+        is_resolved = False
+        is_pending_compliance = True
+    else:
+        status_str = "Passed"
+        is_resolved = False
+        is_pending_compliance = False
+
     return {
         "shipment_id": shipment_id,
+        "status": status_str,
+        "is_resolved": is_resolved,
+        "is_pending_compliance": is_pending_compliance,
         "documents": documents,
         "anomalies": shipment_anoms,
         "indicators": ind,
@@ -489,9 +529,11 @@ def save_shipment_overrides(shipment_id: str, payload: OverridesRequest):
 @app.delete("/api/shipments/{shipment_id}/overrides/{doc_type}")
 def reset_shipment_override(shipment_id: str, doc_type: str):
     table_id = f"{PROJECT_ID}.{DATASET_ID}.Audited_Overrides_Tbl"
+    doc_clause = f"document_type = '{doc_type}'" if doc_type.upper() != "ALL" else "1=1"
+    
     delete_query = f"""
     DELETE FROM `{table_id}`
-    WHERE shipment_id = '{shipment_id}' AND document_type = '{doc_type}'
+    WHERE shipment_id = '{shipment_id}' AND {doc_clause}
     """
     try:
         query_job = bq_client.query(delete_query)
@@ -499,8 +541,8 @@ def reset_shipment_override(shipment_id: str, doc_type: str):
     except Exception as e:
         if "streaming buffer" in str(e).lower():
             try:
-                # Streaming buffer fallback: Select non-deleted rows into dataframe and overwrite table using batch Load Job
-                select_query = f"SELECT * FROM `{table_id}` WHERE NOT (shipment_id = '{shipment_id}' AND document_type = '{doc_type}')"
+                # Streaming buffer fallback
+                select_query = f"SELECT * FROM `{table_id}` WHERE NOT (shipment_id = '{shipment_id}' AND {doc_clause})"
                 df = bq_client.query(select_query).to_dataframe()
                 job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
                 bq_client.load_table_from_dataframe(df, table_id, job_config=job_config).result()
@@ -509,15 +551,16 @@ def reset_shipment_override(shipment_id: str, doc_type: str):
         else:
             raise HTTPException(status_code=500, detail=f"BigQuery Delete Overrides Error: {e}")
 
-    # Delete audited PDF blob from GCS
+    # Delete audited PDF blob(s) from GCS
     try:
         prefix = f"shipment_{shipment_id}/"
         bucket = storage_client.bucket(BUCKET_NAME)
         blobs = list(bucket.list_blobs(prefix=prefix))
         for b in blobs:
-            if b.name.lower().endswith('.pdf') and doc_type.lower() in b.name.lower() and "_audited" in b.name.lower():
-                b.delete()
-                print(f"Deleted audited blob: {b.name}")
+            if b.name.lower().endswith('.pdf') and "_audited" in b.name.lower():
+                if doc_type.upper() == "ALL" or doc_type.lower() in b.name.lower():
+                    b.delete()
+                    print(f"Deleted audited blob: {b.name}")
     except Exception as e:
         print(f"Error deleting audited blob for {doc_type}: {e}")
 
@@ -527,6 +570,84 @@ def reset_shipment_override(shipment_id: str, doc_type: str):
     cache_store["indicators"]["data"] = None
 
     return {"status": "success", "message": f"Reset {doc_type} corrections successfully."}
+
+@app.post("/api/shipments/{shipment_id}/resolve")
+def resolve_shipment_compliance(shipment_id: str):
+    """Flags a shipment as manually confirmed compliant / resolved in BigQuery anomalies table."""
+    delete_query = f"""
+    DELETE FROM `{PROJECT_ID}.{DATASET_ID}.Shipment_Anomalies_Tbl`
+    WHERE shipment_id = '{shipment_id}'
+    """
+    try:
+        query_job = bq_client.query(delete_query)
+        query_job.result()
+    except Exception as e:
+        if "streaming buffer" in str(e).lower():
+            try:
+                select_query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.Shipment_Anomalies_Tbl` WHERE shipment_id != '{shipment_id}'"
+                df = bq_client.query(select_query).to_dataframe()
+                job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
+                table_id = f"{PROJECT_ID}.{DATASET_ID}.Shipment_Anomalies_Tbl"
+                bq_client.load_table_from_dataframe(df, table_id, job_config=job_config).result()
+            except Exception as inner_e:
+                print(f"Resolve streaming buffer fallback warning: {inner_e}")
+        else:
+            print(f"Error flagging shipment compliance: {e}")
+
+    # Mark in Audited_Overrides_Tbl so shipment status is tracked as 'Resolved'
+    override_table = f"{PROJECT_ID}.{DATASET_ID}.Audited_Overrides_Tbl"
+    row = [{
+        "shipment_id": shipment_id,
+        "document_type": "COMPLIANCE",
+        "field_name": "status",
+        "original_value": "Failed",
+        "audited_value": "Resolved",
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+    }]
+    try:
+        load_job = bq_client.load_table_from_json(row, override_table)
+        load_job.result()
+    except Exception as e:
+        print(f"Error inserting compliance override: {e}")
+
+    cache_store["queue"]["data"] = None
+    cache_store["anomalies"]["data"] = None
+    cache_store["indicators"]["data"] = None
+
+    return {"status": "success", "shipment_id": shipment_id, "message": "Shipment flagged as compliant / resolved."}
+
+@app.post("/api/shipments/{shipment_id}/reopen")
+def reopen_shipment_audit(shipment_id: str):
+    """Re-opens audit for a shipment, removing compliance marker and restoring anomaly tracking in BigQuery."""
+    # 1. Remove COMPLIANCE override marker
+    override_table = f"{PROJECT_ID}.{DATASET_ID}.Audited_Overrides_Tbl"
+    del_override = f"DELETE FROM `{override_table}` WHERE shipment_id = '{shipment_id}' AND document_type = 'COMPLIANCE'"
+    try:
+        bq_client.query(del_override).result()
+    except Exception as e:
+        print(f"Error removing compliance override marker: {e}")
+
+    # 2. Re-insert manual anomaly flag into Shipment_Anomalies_Tbl so UI tracks it as failed/open
+    table_id = f"{PROJECT_ID}.{DATASET_ID}.Shipment_Anomalies_Tbl"
+    row = [{
+        "shipment_id": shipment_id,
+        "discrepancy_category": "Manual Audit Re-opened",
+        "field_flagged": "status",
+        "expected_value": "Under Auditor Review",
+        "actual_value": "Re-opened for Editing",
+        "processed_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+    }]
+    try:
+        load_job = bq_client.load_table_from_json(row, table_id)
+        load_job.result()
+    except Exception as e:
+        print(f"Error re-opening shipment audit in BQ: {e}")
+
+    cache_store["queue"]["data"] = None
+    cache_store["anomalies"]["data"] = None
+    cache_store["indicators"]["data"] = None
+
+    return {"status": "success", "shipment_id": shipment_id, "message": "Shipment audit re-opened successfully."}
 
 @app.post("/api/sync")
 def trigger_sync():
@@ -542,6 +663,104 @@ def trigger_sync():
         return {"status": "success", "message": "Ingestion sync job triggered successfully."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error triggering sync job: {e}")
+
+# --- Auth & Agent Session Endpoints ---
+
+try:
+    from web_app.backend.auth import extract_user_from_request
+    from web_app.backend.agent.memory import (
+        get_user_sessions,
+        create_user_session,
+        get_session_messages,
+        delete_user_session,
+        add_session_message,
+    )
+    from web_app.backend.agent.runner import run_agent_turn
+except ImportError:
+    from auth import extract_user_from_request
+    from agent.memory import (
+        get_user_sessions,
+        create_user_session,
+        get_session_messages,
+        delete_user_session,
+        add_session_message,
+    )
+    from agent.runner import run_agent_turn
+
+@app.get("/api/auth/me")
+def get_current_user(request: Request):
+    user_info = extract_user_from_request(request)
+    return user_info
+
+@app.get("/api/agent/sessions")
+def list_sessions(request: Request):
+    user_info = extract_user_from_request(request)
+    user_id = user_info["user_id"]
+    sessions = get_user_sessions(user_id)
+    return {"sessions": sessions}
+
+class CreateSessionRequest(BaseModel):
+    title: Optional[str] = ""
+
+@app.post("/api/agent/sessions")
+def create_session(request: Request, payload: CreateSessionRequest):
+    user_info = extract_user_from_request(request)
+    user_id = user_info["user_id"]
+    title = payload.title or "New Audit Thread"
+    session = create_user_session(user_id, title)
+    return session
+
+@app.get("/api/agent/sessions/{session_id}/messages")
+def list_session_messages(session_id: str, request: Request):
+    user_info = extract_user_from_request(request)
+    user_id = user_info["user_id"]
+    messages = get_session_messages(user_id, session_id)
+    return {"messages": messages}
+
+@app.delete("/api/agent/sessions/{session_id}")
+def remove_session(session_id: str, request: Request):
+    user_info = extract_user_from_request(request)
+    user_id = user_info["user_id"]
+    delete_user_session(user_id, session_id)
+    return {"status": "success", "message": "Session deleted"}
+
+class AgentChatRequest(BaseModel):
+    message: str
+    session_id: Optional[str] = ""
+    current_shipment_id: Optional[str] = ""
+
+@app.post("/api/agent/chat")
+def agent_chat(payload: AgentChatRequest, request: Request):
+    user_info = extract_user_from_request(request)
+    user_id = user_info["user_id"]
+    
+    session_id = payload.session_id
+    if not session_id:
+        session = create_user_session(user_id, f"Audit {payload.current_shipment_id or 'Thread'}")
+        session_id = session["session_id"]
+
+    # Save user message to persistent memory
+    add_session_message(user_id, session_id, "user", payload.message)
+
+    # Run agent turn
+    prompt_text = payload.message
+    if payload.current_shipment_id:
+        prompt_text = f"[Active Canvas Context: Currently inspecting Shipment #{payload.current_shipment_id}]\n\n{payload.message}"
+
+    result = run_agent_turn(prompt_text, session_id=session_id)
+    
+    agent_resp = result.get("response", "Task completed.")
+    trajectory = result.get("trajectory", [])
+
+    # Save agent response to persistent memory
+    add_session_message(user_id, session_id, "agent", agent_resp, trajectory=trajectory)
+
+    return {
+        "status": "success",
+        "session_id": session_id,
+        "response": agent_resp,
+        "trajectory": trajectory,
+    }
 
 from fastapi.staticfiles import StaticFiles
 

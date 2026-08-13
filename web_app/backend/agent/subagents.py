@@ -2,8 +2,12 @@ from agent.tools.bq_tools import (
     fetch_master_queue,
     fetch_shipment_anomalies,
     save_field_override,
+    batch_update_document_overrides,
     reset_field_overrides,
-    auto_resolve_shipment_discrepancies
+    auto_resolve_shipment_discrepancies,
+    query_foreign_currency_shipments,
+    query_zero_dollar_item_shipments,
+    query_shipments_by_custom_filter
 )
 from agent.tools.pipeline_tools import (
     trigger_drive_ingestion_sync,
@@ -19,11 +23,15 @@ INGESTION_SUBAGENT_TOOLS = [
 
 AUDIT_SUBAGENT_TOOLS = [
     fetch_master_queue,
-    fetch_shipment_anomalies
+    fetch_shipment_anomalies,
+    query_foreign_currency_shipments,
+    query_zero_dollar_item_shipments,
+    query_shipments_by_custom_filter
 ]
 
 RESOLUTION_SUBAGENT_TOOLS = [
     save_field_override,
+    batch_update_document_overrides,
     reset_field_overrides,
     auto_resolve_shipment_discrepancies
 ]

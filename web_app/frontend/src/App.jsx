@@ -2,11 +2,14 @@ import React, { useState, useEffect } from "react";
 import Header from "./components/Header";
 import QueueTable from "./components/QueueTable";
 import InspectionView from "./components/InspectionView";
-import { fetchQueue, triggerSync } from "./services/api";
+import AgentCanvasView from "./components/AgentCanvasView";
+import { fetchQueue, triggerSync, fetchShipmentDetail } from "./services/api";
 
 export default function App() {
-  const [view, setView] = useState("master"); // 'master' or 'detail'
-  const [selectedShipment, setSelectedShipment] = useState(null);
+  const [viewMode, setViewMode] = useState("canvas"); // 'canvas' or 'grid'
+  const [view, setView] = useState("master"); // 'master' or 'detail' (for grid mode)
+  const [selectedShipment, setSelectedShipment] = useState(null); // Defaults to null (no document shown until requested)
+  const [shipmentDetail, setShipmentDetail] = useState(null);
   const [shipments, setShipments] = useState([]);
   const [loading, setLoading] = useState(true);
   const [isSyncing, setIsSyncing] = useState(false);
@@ -16,7 +19,8 @@ export default function App() {
     try {
       setLoading(true);
       const data = await fetchQueue();
-      setShipments(data.shipments || []);
+      const list = data.shipments || [];
+      setShipments(list);
     } catch (err) {
       console.error(err);
     } finally {
@@ -28,12 +32,26 @@ export default function App() {
     loadQueue();
   }, []);
 
+  // Fetch detail for selectedShipment when selected
+  useEffect(() => {
+    if (selectedShipment) {
+      fetchShipmentDetail(selectedShipment)
+        .then((data) => setShipmentDetail(data))
+        .catch((err) => console.error("Error loading shipment detail:", err));
+    } else {
+      setShipmentDetail(null);
+    }
+  }, [selectedShipment]);
+
   const handleSync = async () => {
     try {
       setIsSyncing(true);
       await triggerSync();
-      // Reload queue after sync call
       await loadQueue();
+      if (selectedShipment) {
+        const data = await fetchShipmentDetail(selectedShipment);
+        setShipmentDetail(data);
+      }
     } catch (err) {
       console.error(err);
     } finally {
@@ -55,18 +73,34 @@ export default function App() {
     resolved: shipments.filter(s => s.status === "Resolved").length,
   };
 
+  const handleViewModeChange = (mode) => {
+    setViewMode(mode);
+    if (mode === "canvas") {
+      setSelectedShipment(null);
+    }
+  };
+
   return (
-    <div style={{ padding: "24px", maxWidth: "1600px", margin: "0 auto" }}>
+    <div style={{ padding: "20px 24px", maxWidth: "1750px", margin: "0 auto" }}>
       <Header
         stats={stats}
         onSync={handleSync}
         isSyncing={isSyncing}
         theme={theme}
         onToggleTheme={toggleTheme}
+        viewMode={viewMode}
+        onViewModeChange={handleViewModeChange}
       />
 
       <main>
-        {view === "master" ? (
+        {viewMode === "canvas" ? (
+          <AgentCanvasView
+            selectedShipment={selectedShipment}
+            shipmentDetail={shipmentDetail}
+            onSelectShipment={setSelectedShipment}
+            onRefresh={loadQueue}
+          />
+        ) : view === "master" ? (
           loading ? (
             <div className="glass-card" style={{ padding: "48px", textAlign: "center" }}>
               <p style={{ color: "var(--text-muted)" }}>Loading Master Audit Queue...</p>
@@ -85,8 +119,7 @@ export default function App() {
             shipmentId={selectedShipment}
             onBack={() => {
               setView("master");
-              setSelectedShipment(null);
-              loadQueue(); // Refresh queue when returning
+              loadQueue();
             }}
           />
         )}

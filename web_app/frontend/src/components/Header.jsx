@@ -1,5 +1,5 @@
 import React from "react";
-import { ShieldCheck, RefreshCw, Sun, Moon, Search } from "lucide-react";
+import { ShieldCheck, RefreshCw, Sun, Moon, LayoutGrid, Bot } from "lucide-react";
 
 export default function Header({ 
   stats, 
@@ -7,23 +7,69 @@ export default function Header({
   isSyncing, 
   theme, 
   onToggleTheme, 
-  searchTerm, 
-  onSearchChange 
+  viewMode = "canvas", 
+  onViewModeChange 
 }) {
   return (
-    <header className="glass-card" style={{ padding: "16px 24px", marginBottom: "24px", display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: "16px" }}>
+    <header className="glass-card" style={{ padding: "16px 24px", marginBottom: "20px", display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: "16px" }}>
       {/* Brand Logo & Title */}
       <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
         <div style={{ background: "linear-gradient(135deg, #0284c7 0%, #38bdf8 100%)", padding: "10px", borderRadius: "10px", display: "flex", alignItems: "center", justifyContent: "center" }}>
           <ShieldCheck size={26} color="#ffffff" />
         </div>
         <div>
-          <h1 style={{ fontSize: "1.4rem", fontWeight: "700" }}>Logistics Audit AI Platform</h1>
-          <p style={{ fontSize: "0.82rem", color: "var(--text-muted)" }}>Automated Cross-Document Auditing & Instant Auditor Override Engine</p>
+          <h1 style={{ fontSize: "1.3rem", fontWeight: "700", margin: 0 }}>Logistics Audit AI Platform</h1>
+          <p style={{ fontSize: "0.8rem", color: "var(--text-muted)", margin: 0 }}>Automated Cross-Document Auditing & Google ADK Agent Canvas</p>
         </div>
       </div>
 
-      {/* Metrics Bar */}
+      {/* Dual-Mode Workspace Switcher Toggle */}
+      <div style={{ display: "flex", alignItems: "center", background: "rgba(0, 0, 0, 0.25)", padding: "4px", borderRadius: "12px", border: "1px solid var(--bg-card-border)" }}>
+        <button
+          type="button"
+          onClick={() => onViewModeChange && onViewModeChange("canvas")}
+          style={{
+            padding: "8px 16px",
+            borderRadius: "10px",
+            fontWeight: "600",
+            fontSize: "0.85rem",
+            cursor: "pointer",
+            border: "none",
+            background: viewMode === "canvas" ? "linear-gradient(135deg, #8b5cf6 0%, #ec4899 100%)" : "transparent",
+            color: viewMode === "canvas" ? "#ffffff" : "var(--text-muted)",
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            transition: "all 0.2s ease",
+            boxShadow: viewMode === "canvas" ? "0 4px 12px rgba(139, 92, 246, 0.3)" : "none"
+          }}
+        >
+          <Bot size={16} /> Agent Canvas
+        </button>
+        <button
+          type="button"
+          onClick={() => onViewModeChange && onViewModeChange("grid")}
+          style={{
+            padding: "8px 16px",
+            borderRadius: "10px",
+            fontWeight: "600",
+            fontSize: "0.85rem",
+            cursor: "pointer",
+            border: "none",
+            background: viewMode === "grid" ? "linear-gradient(135deg, #8b5cf6 0%, #ec4899 100%)" : "transparent",
+            color: viewMode === "grid" ? "#ffffff" : "var(--text-muted)",
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            transition: "all 0.2s ease",
+            boxShadow: viewMode === "grid" ? "0 4px 12px rgba(139, 92, 246, 0.3)" : "none"
+          }}
+        >
+          <LayoutGrid size={16} /> Grid Dashboard
+        </button>
+      </div>
+
+      {/* Metrics Bar & Actions */}
       <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
         <div style={{ display: "flex", gap: "12px", background: "rgba(0, 0, 0, 0.15)", padding: "6px 14px", borderRadius: "10px", border: "1px solid var(--bg-card-border)" }}>
           <div style={{ textAlign: "center" }}>
@@ -55,7 +101,7 @@ export default function Header({
           style={{ opacity: isSyncing ? 0.7 : 1, cursor: isSyncing ? "not-allowed" : "pointer" }}
         >
           <RefreshCw size={16} className={isSyncing ? "spin-icon" : ""} />
-          {isSyncing ? "Syncing Drive PDFs..." : "Sync New Documents"}
+          {isSyncing ? "Syncing..." : "Sync Drive"}
         </button>
 
         {/* Theme Toggle */}
