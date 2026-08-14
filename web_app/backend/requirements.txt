@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+google-genai
+google-cloud-bigquery
+google-cloud-storage
+google-cloud-firestore
+google-cloud-aiplatform
+google-cloud-run
+pandas
+reportlab
+pypdf
+db-dtypes
+requests
+python-multipart

@@ -93,35 +93,39 @@ export default function App() {
       />
 
       <main>
-        {viewMode === "canvas" ? (
+        <div style={{ display: viewMode === "canvas" ? "block" : "none" }}>
           <AgentCanvasView
             selectedShipment={selectedShipment}
             shipmentDetail={shipmentDetail}
             onSelectShipment={setSelectedShipment}
             onRefresh={loadQueue}
           />
-        ) : view === "master" ? (
-          loading ? (
-            <div className="glass-card" style={{ padding: "48px", textAlign: "center" }}>
-              <p style={{ color: "var(--text-muted)" }}>Loading Master Audit Queue...</p>
-            </div>
+        </div>
+
+        {viewMode === "grid" && (
+          view === "master" ? (
+            loading ? (
+              <div className="glass-card" style={{ padding: "48px", textAlign: "center" }}>
+                <p style={{ color: "var(--text-muted)" }}>Loading Master Audit Queue...</p>
+              </div>
+            ) : (
+              <QueueTable
+                shipments={shipments}
+                onSelectShipment={(id) => {
+                  setSelectedShipment(id);
+                  setView("detail");
+                }}
+              />
+            )
           ) : (
-            <QueueTable
-              shipments={shipments}
-              onSelectShipment={(id) => {
-                setSelectedShipment(id);
-                setView("detail");
+            <InspectionView
+              shipmentId={selectedShipment}
+              onBack={() => {
+                setView("master");
+                loadQueue();
               }}
             />
           )
-        ) : (
-          <InspectionView
-            shipmentId={selectedShipment}
-            onBack={() => {
-              setView("master");
-              loadQueue();
-            }}
-          />
         )}
       </main>
     </div>

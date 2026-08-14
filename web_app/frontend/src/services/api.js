@@ -1,7 +1,20 @@
-const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:8000/api";
+const API_BASE_URL = import.meta.env.VITE_API_URL || "/api";
+
+async function customFetch(url, options = {}) {
+  const opts = {
+    credentials: "same-origin",
+    ...options,
+  };
+  const res = await fetch(url, opts);
+  const contentType = res.headers.get("content-type") || "";
+  if (contentType.includes("text/html")) {
+    throw new Error("Received HTML response from server instead of API JSON");
+  }
+  return res;
+}
 
 export async function fetchQueue() {
-  const res = await fetch(`${API_BASE_URL}/queue`);
+  const res = await customFetch(`${API_BASE_URL}/queue`);
   if (!res.ok) {
     throw new Error(`Failed to fetch queue: ${res.statusText}`);
   }
@@ -9,7 +22,7 @@ export async function fetchQueue() {
 }
 
 export async function fetchShipmentDetail(shipmentId) {
-  const res = await fetch(`${API_BASE_URL}/shipments/${shipmentId}`);
+  const res = await customFetch(`${API_BASE_URL}/shipments/${shipmentId}`);
   if (!res.ok) {
     throw new Error(`Failed to fetch shipment detail: ${res.statusText}`);
   }
@@ -21,7 +34,7 @@ export function getPdfStreamUrl(shipmentId, blobName) {
 }
 
 export async function saveOverrides(shipmentId, overrides) {
-  const res = await fetch(`${API_BASE_URL}/shipments/${shipmentId}/overrides`, {
+  const res = await customFetch(`${API_BASE_URL}/shipments/${shipmentId}/overrides`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ overrides }),
@@ -33,7 +46,7 @@ export async function saveOverrides(shipmentId, overrides) {
 }
 
 export async function triggerSync() {
-  const res = await fetch(`${API_BASE_URL}/sync`, { method: "POST" });
+  const res = await customFetch(`${API_BASE_URL}/sync`, { method: "POST" });
   if (!res.ok) {
     throw new Error(`Failed to trigger sync: ${res.statusText}`);
   }
@@ -41,7 +54,7 @@ export async function triggerSync() {
 }
 
 export async function resetOverrides(shipmentId, docType) {
-  const res = await fetch(`${API_BASE_URL}/shipments/${shipmentId}/overrides/${docType}`, {
+  const res = await customFetch(`${API_BASE_URL}/shipments/${shipmentId}/overrides/${docType}`, {
     method: "DELETE",
   });
   if (!res.ok) {
@@ -52,7 +65,7 @@ export async function resetOverrides(shipmentId, docType) {
 }
 
 export async function flagShipmentResolved(shipmentId) {
-  const res = await fetch(`${API_BASE_URL}/shipments/${shipmentId}/resolve`, {
+  const res = await customFetch(`${API_BASE_URL}/shipments/${shipmentId}/resolve`, {
     method: "POST",
   });
   if (!res.ok) {
@@ -63,7 +76,7 @@ export async function flagShipmentResolved(shipmentId) {
 }
 
 export async function reopenShipmentAudit(shipmentId) {
-  const res = await fetch(`${API_BASE_URL}/shipments/${shipmentId}/reopen`, {
+  const res = await customFetch(`${API_BASE_URL}/shipments/${shipmentId}/reopen`, {
     method: "POST",
   });
   if (!res.ok) {
@@ -80,7 +93,7 @@ export async function fetchAuthUser(devEmail = "") {
   if (devEmail) {
     headers["x-dev-user-email"] = devEmail;
   }
-  const res = await fetch(`${API_BASE_URL}/auth/me`, { headers });
+  const res = await customFetch(`${API_BASE_URL}/auth/me`, { headers });
   if (!res.ok) {
     throw new Error(`Failed to fetch auth user: ${res.statusText}`);
   }
@@ -92,7 +105,7 @@ export async function fetchUserSessions(devEmail = "") {
   if (devEmail) {
     headers["x-dev-user-email"] = devEmail;
   }
-  const res = await fetch(`${API_BASE_URL}/agent/sessions`, { headers });
+  const res = await customFetch(`${API_BASE_URL}/agent/sessions`, { headers });
   if (!res.ok) {
     throw new Error(`Failed to fetch sessions: ${res.statusText}`);
   }
@@ -104,7 +117,7 @@ export async function createNewSession(title = "", devEmail = "") {
   if (devEmail) {
     headers["x-dev-user-email"] = devEmail;
   }
-  const res = await fetch(`${API_BASE_URL}/agent/sessions`, {
+  const res = await customFetch(`${API_BASE_URL}/agent/sessions`, {
     method: "POST",
     headers,
     body: JSON.stringify({ title }),
@@ -120,7 +133,7 @@ export async function fetchSessionMessages(sessionId, devEmail = "") {
   if (devEmail) {
     headers["x-dev-user-email"] = devEmail;
   }
-  const res = await fetch(`${API_BASE_URL}/agent/sessions/${sessionId}/messages`, { headers });
+  const res = await customFetch(`${API_BASE_URL}/agent/sessions/${sessionId}/messages`, { headers });
   if (!res.ok) {
     throw new Error(`Failed to fetch session messages: ${res.statusText}`);
   }
@@ -132,7 +145,7 @@ export async function deleteSession(sessionId, devEmail = "") {
   if (devEmail) {
     headers["x-dev-user-email"] = devEmail;
   }
-  const res = await fetch(`${API_BASE_URL}/agent/sessions/${sessionId}`, {
+  const res = await customFetch(`${API_BASE_URL}/agent/sessions/${sessionId}`, {
     method: "DELETE",
     headers,
   });
@@ -159,7 +172,7 @@ export async function sendAgentMessage(message, sessionId = "", currentShipmentI
   if (signal) {
     options.signal = signal;
   }
-  const res = await fetch(`${API_BASE_URL}/agent/chat`, options);
+  const res = await customFetch(`${API_BASE_URL}/agent/chat`, options);
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.detail || `Agent request failed: ${res.statusText}`);

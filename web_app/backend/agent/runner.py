@@ -187,17 +187,20 @@ def parse_and_execute_item_instruction(user_prompt: str, target_sid: str) -> Opt
 Your job is to read the user's natural language prompt, classify its intent, and if it is an instruction to modify/edit line items on the active shipment SLI document, calculate the exact new numeric values.
 
 CRITICAL INTENT CLASSIFICATION RULE:
-- Set `is_item_update = true` ONLY if the user prompt is an explicit request to modify, edit, adjust, add to, subtract from, set, or split values for line items on the current shipment document.
-- Set `is_item_update = false` if the user prompt is a general question, search query, database query across all shipments (e.g. "Show all shipments with...", "List shipments...", "Which shipments..."), or unrelated inquiry.
+- Set `is_item_update = true` if the user prompt is an explicit request to modify, edit, adjust, add to, subtract from, set, split, or "add the differences of all three fields / all fields" for line items on the current shipment document.
+- Set `is_item_update = false` ONLY if the user prompt is a general question, search query, database query across all shipments (e.g. "Show all shipments with...", "List shipments...", "Which shipments..."), or unrelated inquiry.
 
-Target Fields available per item index (0-indexed):
+Target Fields available per item index (0-indexed, where "first item" or "item #1" = index 0):
 - `items_{idx}_value_usd`
 - `items_{idx}_gross_weight_kg`
 - `items_{idx}_net_weight_kg`
 
 Rule & Math Directives:
-1. If the user asks to "add the difference" or "fix difference", calculate difference = (expected_value - actual_value) from the anomalies for the matching category/field, and add that amount to the requested item(s).
-2. If the user asks to split or distribute an amount across items, calculate the per-item addition or percentage split and compute new numeric values.
+1. If the user asks to "add the differences of all three fields", "apply all differences", or "add differences" to an item (e.g. "first item" / "item 1"):
+   - For Financial discrepancy (e.g., SLI total $1774 vs CIV source $1800, difference +$26): Add $26 to item #1 current `value_usd`.
+   - For Gross Weight discrepancy (e.g., SLI total 110.4 kg vs PKL source 168 kg, difference +57.6 kg): Add 57.6 kg to item #1 current `gross_weight_kg`.
+   - For Net Weight discrepancy (e.g., SLI total 87.4 kg vs PKL source 114.1 kg, difference +26.7 kg): Add 26.7 kg to item #1 current `net_weight_kg`.
+2. Compute new_value = current_item_value + calculated_difference for each specified field.
 3. Keep current item values unchanged unless specified or affected by the prompt.
 4. Return exact floating point numbers rounded to 3 decimal places as string values in `overrides`.
 
@@ -205,10 +208,11 @@ Output Schema (JSON):
 {
   "is_item_update": boolean,
   "reasoning": "Step-by-step reasoning explaining intent classification and how target item new values were derived",
-  "applied_descriptions": ["Added $X to item #1", ...],
+  "applied_descriptions": ["Added $26 to item #1 value_usd", "Added 57.6 kg to item #1 gross_weight_kg", "Added 26.7 kg to item #1 net_weight_kg"],
   "overrides": {
-    "items_0_net_weight_kg": "72.781",
-    "items_7_gross_weight_kg": "26.561"
+    "items_0_value_usd": "71.000",
+    "items_0_gross_weight_kg": "60.360",
+    "items_0_net_weight_kg": "28.870"
   }
 }
 """

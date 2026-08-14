@@ -10,7 +10,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel
 import pandas as pd
-from google.cloud import bigquery, storage, run_v2
+from google.cloud import bigquery, storage
+try:
+    from google.cloud import run_v2
+except ImportError:
+    run_v2 = None
 
 # Add directories to sys.path so modules can be imported cleanly
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -25,11 +29,17 @@ try:
 except ImportError:
     pdf_generator = None
 
-PROJECT_ID = "it-ai-briggs-agentspace"
-DATASET_ID = "logistics_dataset"
-BUCKET_NAME = "logistic-audit-pdfs"
+PROJECT_ID = os.getenv("PROJECT_ID", "it-ai-briggs-agentspace")
+DATASET_ID = os.getenv("DATASET_ID", "logistics_dataset")
+BUCKET_NAME = os.getenv("BUCKET_NAME", "logistic-audit-pdfs")
 
 app = FastAPI(title="Logistics Audit API", version="2.0.0")
+
+@app.get("/health")
+@app.get("/healthz")
+@app.get("/api/health")
+def health_check():
+    return {"status": "ok", "service": "Logistics Audit API", "version": "2.0.0"}
 
 # Enable CORS for local React Vite dev server
 app.add_middleware(
@@ -763,11 +773,28 @@ def agent_chat(payload: AgentChatRequest, request: Request):
     }
 
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
-# Serve static frontend build files if dist/ exists
-frontend_dist = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend", "dist")
+frontend_dist = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist")
+if not os.path.exists(frontend_dist):
+    frontend_dist = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend", "dist")
+
 if os.path.exists(frontend_dist):
-    app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="static")
+    assets_dir = os.path.join(frontend_dist, "assets")
+    if os.path.exists(assets_dir):
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        if full_path.startswith("api/") or full_path == "api":
+            raise HTTPException(status_code=404, detail="API endpoint not found")
+        file_path = os.path.join(frontend_dist, full_path)
+        if full_path and os.path.exists(file_path) and os.path.isfile(file_path):
+            return FileResponse(file_path)
+        index_file = os.path.join(frontend_dist, "index.html")
+        if os.path.exists(index_file):
+            return FileResponse(index_file)
+        raise HTTPException(status_code=404, detail="Frontend dist index.html not found")
 
 if __name__ == "__main__":
     import uvicorn

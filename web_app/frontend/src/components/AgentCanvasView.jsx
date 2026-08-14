@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import { Send, Bot, User, Cpu, Sparkles, FileText, RefreshCw, Eye, Wrench, RotateCcw, Square, CheckCircle2, X } from "lucide-react";
-import { sendAgentMessage, fetchShipmentDetail, resetOverrides, flagShipmentResolved, reopenShipmentAudit, fetchQueue } from "../services/api";
+import { sendAgentMessage, fetchShipmentDetail, resetOverrides, flagShipmentResolved, reopenShipmentAudit, fetchQueue, fetchUserSessions, fetchSessionMessages, createNewSession } from "../services/api";
 import PdfViewer from "./PdfViewer";
 import AnomaliesPanel from "./AnomaliesPanel";
 
@@ -17,6 +17,7 @@ export default function AgentCanvasView({
       trajectory: []
     }
   ]);
+  const [sessionId, setSessionId] = useState(() => localStorage.getItem("active_audit_session_id") || "");
   const [inputPrompt, setInputPrompt] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [isCanvasLoading, setIsCanvasLoading] = useState(false);
@@ -26,6 +27,40 @@ export default function AgentCanvasView({
 
   const chatEndRef = useRef(null);
   const abortControllerRef = useRef(null);
+
+  // Restore persistent chat history from Firestore on mount
+  useEffect(() => {
+    async function restoreSessionHistory() {
+      try {
+        let activeSid = localStorage.getItem("active_audit_session_id");
+        if (!activeSid) {
+          const sessions = await fetchUserSessions().catch(() => []);
+          if (sessions && sessions.length > 0) {
+            activeSid = sessions[0].session_id;
+          } else {
+            const newSess = await createNewSession("Logistics Master Audit").catch(() => null);
+            if (newSess) activeSid = newSess.session_id;
+          }
+        }
+        if (activeSid) {
+          setSessionId(activeSid);
+          localStorage.setItem("active_audit_session_id", activeSid);
+          const msgs = await fetchSessionMessages(activeSid).catch(() => []);
+          if (msgs && msgs.length > 0) {
+            const formatted = msgs.map((m) => ({
+              role: m.role === "user" ? "user" : "agent",
+              text: m.content,
+              trajectory: m.trajectory || [],
+            }));
+            setMessages(formatted);
+          }
+        }
+      } catch (err) {
+        console.error("Error restoring chat session history:", err);
+      }
+    }
+    restoreSessionHistory();
+  }, []);
 
   // Load shipment queue for manual shipment picker dropdown
   useEffect(() => {
@@ -70,7 +105,7 @@ export default function AgentCanvasView({
     try {
       const res = await sendAgentMessage(
         textToSend, 
-        "web_canvas_session", 
+        sessionId, 
         selectedShipment, 
         "", 
         controller.signal
