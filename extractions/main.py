@@ -304,8 +304,8 @@ async def process_shipment_concurrently(shipment_id: str, document_uris: dict, p
         CAST('{processed_at}' AS TIMESTAMP) AS processed_at,
         'Weight' AS discrepancy_category,
         'Gross Weight (LB)' AS field_flagged,
-        CAST(v.gross_weight_lb AS STRING) AS expected_value,
-        CAST(p.gross_weight_lb AS STRING) AS actual_value
+        CAST(p.gross_weight_lb AS STRING) AS expected_value,
+        CAST(v.gross_weight_lb AS STRING) AS actual_value
     FROM LatestVGM v
     JOIN LatestPKLBase p 
         ON v.shipment_id = p.shipment_id
