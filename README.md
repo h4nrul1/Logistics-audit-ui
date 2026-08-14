@@ -1,6 +1,30 @@
-# 🚢 Logistics Document Auditing System & Master Dashboard
+# 🚢 Logistics Audit Platform & ADK Master AI Agent
 
-A comprehensive, end-to-end, AI-powered document processing and auditing platform built for logistics teams. The system automatically ingests multi-document shipment packages (Commercial Invoices, Packing Lists, Shipper's Letter of Instructions, Verified Gross Mass), extracts structured data using Google Gemini 2.5 Pro multimodal models, executes automated cross-validation reconciliation in BigQuery, and provides a Streamlit web interface for logistics document auditing and anomaly monitoring.
+An end-to-end, AI-powered logistics document processing, cross-validation, and automated anomaly resolution platform built on **Google Agent Development Kit (ADK)**, **Gemini 2.5 Pro**, **FastAPI**, **React**, and **BigQuery**.
+
+The system ingests multi-document shipment packages (Commercial Invoices, Packing Lists, Shipper's Letter of Instructions, Verified Gross Mass), executes automated reconciliation in BigQuery, and provides a dual-mode interactive workspace featuring a **Master Grid Dashboard** and an **Agent Canvas Workspace** with real-time reasoning and stamp-certified audited PDF generation.
+
+---
+
+## 🌟 Key Features on `feature/adk-agent` Branch
+
+* 🤖 **Google ADK Master Agent Orchestrator**:
+  * Step-by-step reasoning trajectory streams for full explainability.
+  * Automated tool execution loop (`inspect_shipment_audit`, `auto_resolve_shipment_discrepancies`, `batch_update_document_overrides`, `reset_shipment_overrides`, `flag_shipment_audit_resolved`, `reopen_shipment_audit`).
+  * Natural language item adjustment translator (`parse_and_execute_item_instruction`) powered by Gemini 2.5 Pro to convert prompts like *"Add the differences of all three fields to the first item on SLI"* into exact field override deltas.
+
+* 📄 **Stamp-Certified Audited PDF Generator**:
+  * Real-time PDF modification engine (`pdf_generator.py`) using ReportLab and PyPDF.
+  * Burns dynamic auditor approval stamps, discrepancy summaries, and line-item delta tables directly onto the original PDF document and stores it in Cloud Storage bucket `logistic-audit-pdfs`.
+
+* ⚡ **Modern React SPA + FastAPI Single Container**:
+  * **Agent Canvas View**: Dual-pane workspace with live agent chat stream, tool execution trajectory breakdown, PDF document viewer, anomalies panel, and override controls.
+  * **Grid Dashboard View**: Master audit queue table with status filters (`Passed`, `Failed`, `Resolved`) and one-click Google Drive sync trigger.
+  * **FastAPI Backend**: Unified API endpoints for queue management, shipment detail, agent execution, override resets, and static SPA serving (`web_app/backend/server.py`).
+
+* 💾 **Google Cloud Firestore Persistent Memory**:
+  * Writes user sessions and message logs to Firestore collections (`user_sessions` and `messages` subcollection) in `it-ai-briggs-agentspace`.
+  * SQLite fallback for offline/local development.
 
 ---
 
@@ -8,185 +32,150 @@ A comprehensive, end-to-end, AI-powered document processing and auditing platfor
 
 ```mermaid
 graph TD
-    subgraph 1. Ingestion Phase
-        GDrive["Google Drive\n(Target Folder)"] -->|Scan & Group PDFs| CRJob["Cloud Run Job\n(shipment-ingestion-job)"]
-        CRJob -->|Upload PDFs| GCS["GCS Bucket\n(logistic-audit-pdfs)"]
-        CRJob -->|Move File| GDriveProc["Google Drive\n(Processed Folder)"]
-        CRJob -->|Publish Message| PubSub["Pub/Sub Topic\n(shipment-processing-trigger)"]
+    subgraph 1. Ingestion & Extraction Phase
+        GDrive["Google Drive Folder"] -->|Scan & Group PDFs| Ingestion["Cloud Run Job\n(shipment-ingestion-job)"]
+        Ingestion -->|Upload Raw PDFs| GCS["GCS Bucket\n(logistic-audit-pdfs)"]
+        Ingestion -->|Pub/Sub Event| Extractions["Extractions Service\n(Cloud Run)"]
+        Extractions -->|Multimodal Extract| Gemini["Vertex AI / Gemini 2.5 Pro"]
+        Extractions -->|Insert Records| BQ_Raw["BigQuery Raw Tables\n(CIV, PKL, SLI, VGM)"]
+        Extractions -->|Reconciliation Query| BQ_Anom["BigQuery Anomalies Table\n(Shipment_Anomalies_Tbl)"]
     end
 
-    subgraph 2. Extraction & Audit Phase
-        PubSub -->|Cloud Event| CloudFunc["Extractions Service\n(Cloud Run / Cloud Function)"]
-        CloudFunc -->|Concurrent Async Prompts| Gemini["Vertex AI / Gemini 2.5 Pro\n(Multimodal PDF Extractions)"]
-        Gemini -->|Structured JSON| CloudFunc
-        CloudFunc -->|Load JSON Data| BQ_Raw["BigQuery Raw Tables\n(CIV_Tbl, PKL_Tbl, SLI_Tbl, VGM_Tbl)"]
-        CloudFunc -->|SQL Cross-Validation Query| BQ_Anom["BigQuery Anomalies Table\n(Shipment_Anomalies_Tbl)"]
-    end
-
-    subgraph 3. Human-in-the-Loop Audit UI
-        UI["Streamlit Master Dashboard\n(Cloud Run Port 8080)"] <-->|Read Data| BQ_Raw
-        UI <-->|Fetch Anomaly Status| BQ_Anom
-        UI <-->|Fetch PDFs| GCS
+    subgraph 2. Agent Workspace & Backend
+        User["User Browser / IAP"] <-->|HTTPS| CloudRun["Cloud Run Container\n(logistics-audit-app)"]
+        CloudRun <-->|FastAPI Engine| ADK_Agent["ADK Agent Runner\n(runner.py & Gemini 2.5)"]
+        ADK_Agent <-->|Execute Tools| BQ_Overrides["BigQuery Overrides Table\n(Audited_Overrides_Tbl)"]
+        ADK_Agent <-->|Generate PDF| PDF_Gen["PDF Generator Engine\n(pdf_generator.py)"]
+        PDF_Gen -->|Store Audited PDF| GCS
+        CloudRun <-->|Session Transcripts| Firestore["Google Cloud Firestore\n(user_sessions / messages)"]
     end
 ```
 
 ---
 
-## 📂 Core Components & Repository Structure
+## 📂 Repository Structure
 
 ```
 logistics-audit-ui/
-├── app.py                      # Main Streamlit Master Dashboard application
-├── Dockerfile                  # Docker container definition for Streamlit UI (Port 8080)
-├── requirements.txt            # Python dependencies for the UI application
-├── ingestion/
-│   ├── main.py                 # Ingestion pipeline logic (Drive to GCS transfer + Pub/Sub trigger)
-│   ├── Dockerfile              # Docker container for Cloud Run Ingestion Job
-│   └── requirements.txt        # Dependencies for ingestion script
-└── extractions/
-    ├── main.py                 # Gemini extraction engine + BigQuery SQL audit trigger
-    └── requirements.txt        # Dependencies for AI extraction service
+├── Dockerfile                        # Multi-stage Dockerfile for FastAPI + React Cloud Run deployment
+├── requirements.txt                  # Root Python dependencies
+├── pdf_generator.py                  # Stamp-certified audited PDF generator engine
+├── ingestion/                        # Cloud Run Job for Google Drive file discovery & ingestion
+│   ├── main.py
+│   └── Dockerfile
+├── extractions/                      # Event-driven Gemini extraction service & SQL audit engine
+│   ├── main.py
+│   └── requirements.txt
+└── web_app/
+    ├── backend/                      # Python FastAPI Backend
+    │   ├── server.py                 # Main FastAPI application & SPA static route server
+    │   ├── requirements.txt          # Backend container dependencies
+    │   ├── Dockerfile                # Production Cloud Run container definition
+    │   ├── deploy_agent_engine.py    # Vertex AI Agent Engine deployment wrapper
+    │   └── agent/
+    │       ├── runner.py             # ADK Agent reasoning loop & tool orchestrator
+    │       ├── memory.py             # Firestore persistent memory module
+    │       ├── prompts.py            # Master coordinator system instructions
+    │       └── tools/
+    │           ├── bq_tools.py       # BigQuery audit & override tools
+    │           └── shipment_tools.py # Shipment status & resolution tools
+    └── frontend/                     # React 18 + Vite SPA Frontend
+        ├── package.json
+        ├── vite.config.js
+        └── src/
+            ├── App.jsx               # Main SPA router & view switcher
+            ├── services/api.js       # Centralized REST API client
+            └── components/
+                ├── AgentCanvasView.jsx  # Dual-pane ADK Agent workspace
+                ├── QueueTable.jsx       # Master Audit Queue table
+                ├── InspectionView.jsx   # Detailed shipment inspector
+                ├── PdfViewer.jsx        # PDF document viewer
+                ├── AnomaliesPanel.jsx   # Flagged discrepancies panel
+                └── Header.jsx           # App navigation header & sync trigger
 ```
 
 ---
 
-## 🔄 1. Ingestion Pipeline (`ingestion/`)
+## ☁️ Cloud Infrastructure & GCP Configuration
 
-The ingestion pipeline handles the automated discovery, grouping, validation, and storage of incoming shipment documentation.
-
-### Workflow:
-1. **Google Drive Polling**:
-   - Scans Google Drive folder (`1FOnW5J9k763udzfdxW9d8iPg15RQQq2f`) for unprocessed PDF files matching an 8-digit shipment ID pattern (`_\d{8}`).
-2. **Document Grouping & Completeness Check**:
-   - Groups files by shipment ID.
-   - Enforces presence of the 3 mandatory baseline documents:
-     - **CIV**: Commercial Invoice
-     - **PKL**: Packing List
-     - **SLI**: Shipper's Letter of Instructions
-   - *(Optional document: **VGM** - Verified Gross Mass)*
-3. **Storage & Archival**:
-   - Clears existing GCS files under prefix `shipment_{shipment_id}/` in bucket `logistic-audit-pdfs` to support clean re-uploads.
-   - Streams PDF bytes from Drive to GCS (`gs://logistic-audit-pdfs/shipment_{shipment_id}/{file_name}`).
-   - Moves processed files in Google Drive to the Processed destination folder (`1rAdbu6a9M8mvxdJCSXUduSfQ9RYPuY7u`).
-4. **Event Triggering**:
-   - Publishes a JSON payload to Google Cloud Pub/Sub topic `shipment-processing-trigger`:
-     ```json
-     {
-       "shipment_id": "10351463",
-       "processed_at": "2026-07-28T11:00:00-05:00",
-       "files": {
-         "CIV_10351463_1.pdf": "gs://logistic-audit-pdfs/shipment_10351463/CIV_10351463_1.pdf",
-         "PKL_10351463_1.pdf": "gs://logistic-audit-pdfs/shipment_10351463/PKL_10351463_1.pdf",
-         "SLI_10351463_1.pdf": "gs://logistic-audit-pdfs/shipment_10351463/SLI_10351463_1.pdf"
-       }
-     }
-     ```
-
----
-
-## 🤖 2. Extractions & Cross-Validation Pipeline (`extractions/`)
-
-The extraction pipeline is an event-driven service listening to Pub/Sub events, calling Gemini 2.5 Pro for multimodal structured data extraction, and running an automated cross-validation audit in BigQuery.
-
-### 2.1 Multimodal Extractions (Gemini 2.5 Pro)
-- Utilizes Vertex AI `google-genai` SDK (`gemini-2.5-pro`).
-- Requests are executed asynchronously (`asyncio.gather`) across all shipment documents simultaneously using rigid JSON schemas (`temperature=0.0`).
-
-| Document Type | Schema / Extracted Fields | Prompt Scope |
+| Resource | Value / Name | Description |
 | :--- | :--- | :--- |
-| **CIV** (Commercial Invoice) | `total_amount` (float), `items` (`material_number`, `hts_code`) | Total amount and itemized part numbers / HTS codes. |
-| **PKL** (Packing List) | `gross_weight_lb`, `gross_weight_kg`, `net_weight_lb`, `net_weight_kg`, `pallet_count`, `loose_case_count`, `material_numbers` | Weight totals in LB and KG, pallet/case counts, material numbers. |
-| **SLI** (Shipper's Letter of Instructions) | `total_value_usd`, `gross_weight_kg`, `net_weight_kg`, `items` (`value_usd`, `gross_weight_kg`, `net_weight_kg`) | Total value in USD, gross/net weights, and package line items. |
-| **VGM** (Verified Gross Mass) | `gross_weight_lb`, `gross_weight_kg` | Certified gross weight in LB and KG. |
-
-### 2.2 BigQuery Ingestion
-- Structured JSON outputs are parsed and loaded into BigQuery dataset `it-ai-briggs-agentspace.logistics_dataset`:
-  - `CIV_Tbl`
-  - `PKL_Tbl`
-  - `SLI_Tbl`
-  - `VGM_Tbl`
-
-### 2.3 Automated SQL Cross-Validation Audit Engine
-Upon completing extractions, a SQL audit query evaluates cross-document discrepancies and inserts flag records into `Shipment_Anomalies_Tbl`:
-1. **Financial Cross-Check**: Compares total CIV invoice amount (`SUM(total_amount)`) against SLI total USD value (`total_value_usd`).
-2. **Weight Cross-Check**:
-   - Compares VGM certified gross weight (`gross_weight_lb`) vs PKL gross weight (`gross_weight_lb`).
-   - Compares SLI gross/net weight (KG) vs PKL gross/net weight (KG) using a **1.0 KG tolerance buffer**.
-3. **Material Compliance Check**: Compares itemized material numbers in PKL against CIV material numbers to flag missing compliance numbers.
+| **GCP Project** | `it-ai-briggs-agentspace` | Target project hosting all services. |
+| **GCP Region** | `us-central1` | Deployment region. |
+| **Cloud Run Service** | `logistics-audit-app` | Unified FastAPI + React application endpoint. |
+| **Cloud Run Job** | `shipment-ingestion-job` | Triggered job scanning Google Drive for PDFs. |
+| **GCS Bucket** | `logistic-audit-pdfs` | Document storage for raw and stamp-certified audited PDFs. |
+| **BigQuery Dataset** | `logistics_dataset` | Data warehouse containing extraction, anomaly, and override tables. |
+| **Firestore Database** | `(default)` / `logistics-adk-db` | NoSQL document store for user sessions and chat transcripts. |
+| **Service Account** | `logistics-audit@it-ai-briggs-agentspace.iam.gserviceaccount.com` | IAM principal with BigQuery, Datastore, Storage, Vertex AI, and Cloud Run execution roles. |
 
 ---
 
-## 🖥️ 3. Frontend UI & Master Dashboard (`app.py`)
-
-A Streamlit web dashboard running in Cloud Run providing a centralized control tower for logistics auditors.
-
-### Key Features:
-1. **Master Audit Queue**:
-   - Real-time status tracking (`Passed`, `Failed`, `Resolved`).
-   - Search by Shipment ID and status filters.
-   - **Sync New Documents Now**: Programmatically triggers the Cloud Run Job via `google.cloud.run_v2.JobsClient` and polls BigQuery every 15 seconds until results appear.
-2. **Shipment Inspection View**:
-   - **Document Viewer**: Embedded Base64 PDF viewer inside an iframe with document switching (`CIV`, `PKL`, `SLI`, `VGM`).
-   - **Identified Anomalies Panel**: Displays flagged discrepancies and status evaluation.
-
----
-
-## ☁️ 4. Google Cloud Infrastructure & Deployment
-
-### GCP Resources
-
-| Resource Type | Resource Name | Description |
-| :--- | :--- | :--- |
-| **GCP Project** | `it-ai-briggs-agentspace` | Target project hosting all logistics services. |
-| **GCP Region** | `us-central1` | Default deployment region. |
-| **GCS Bucket** | `logistic-audit-pdfs` | PDF document storage bucket (`shipment_{id}/`). |
-| **Pub/Sub Topic** | `shipment-processing-trigger` | Asynchronous trigger for extraction function. |
-| **Cloud Run Job** | `shipment-ingestion-job` | Scheduled/triggered container job for Drive ingestion. |
-| **Cloud Run / Function** | Extractions Service | Event-driven container processing Pub/Sub triggers. |
-| **Cloud Run Service** | Master Dashboard Service | Web application running Streamlit on Port 8080. |
-| **BigQuery Dataset** | `logistics_dataset` | Data warehouse storing extracted and audited tables. |
-
-### BigQuery Tables Schema Summary
-
-- `CIV_Tbl`: `shipment_id`, `total_amount`, `items` (ARRAY<STRUCT>), `processed_at`
-- `PKL_Tbl`: `shipment_id`, `gross_weight_lb`, `gross_weight_kg`, `net_weight_lb`, `net_weight_kg`, `pallet_count`, `loose_case_count`, `material_numbers` (ARRAY<STRING>), `processed_at`
-- `SLI_Tbl`: `shipment_id`, `total_value_usd`, `gross_weight_kg`, `net_weight_kg`, `items` (ARRAY<STRUCT>), `processed_at`
-- `VGM_Tbl`: `shipment_id`, `gross_weight_lb`, `gross_weight_kg`, `processed_at`
-- `Shipment_Anomalies_Tbl`: `shipment_id`, `processed_at`, `discrepancy_category`, `field_flagged`, `expected_value`, `actual_value`
-
----
-
-## 🚀 5. Local Setup & Execution Guide
+## 🚀 Local Setup & Deployment Guide
 
 ### Prerequisites
 - Python 3.10+
+- Node.js 18+ & npm
 - Google Cloud SDK (`gcloud`) authenticated with access to `it-ai-briggs-agentspace`
-- Docker (for container builds)
 
-### Running the Streamlit UI Locally
+### 1. Running the FastAPI Backend & React Frontend Locally
+
 ```bash
-# 1. Install dependencies
+# 1. Install frontend dependencies and build assets
+cd web_app/frontend
+npm install
+npm run build
+xcopy /E /I /Y dist ..\backend\dist   # Windows (or cp -r dist ../backend/ on Linux/macOS)
+
+# 2. Install backend dependencies
+cd ../backend
 pip install -r requirements.txt
 
-# 2. Authenticate GCP Application Default Credentials
+# 3. Authenticate Google Cloud Application Default Credentials
 gcloud auth application-default login
 
-# 3. Run Streamlit Dashboard
-streamlit run app.py
+# 4. Start FastAPI server
+python -m uvicorn server:app --host 0.0.0.0 --port 8080 --reload
 ```
+Open **[http://localhost:8080](http://localhost:8080)** in your browser.
 
-### Running Ingestion Locally
+---
+
+### 2. Deploying to Google Cloud Run
+
+To build the container image and deploy directly to Cloud Run:
+
 ```bash
-cd ingestion
-pip install -r requirements.txt
-python main.py
+cd web_app/backend
+
+gcloud run deploy logistics-audit-app \
+  --source=. \
+  --region=us-central1 \
+  --project=it-ai-briggs-agentspace \
+  --service-account=logistics-audit@it-ai-briggs-agentspace.iam.gserviceaccount.com \
+  --clear-base-image \
+  --set-env-vars="PROJECT_ID=it-ai-briggs-agentspace,DATASET_ID=logistics_dataset,BUCKET_NAME=logistic-audit-pdfs,USE_FIRESTORE=true" \
+  --allow-unauthenticated
 ```
 
-### Building Docker Containers
-```bash
-# Build UI Container
-docker build -t gcr.io/it-ai-briggs-agentspace/logistics-audit-ui:latest .
+Live Service URL: **[https://logistics-audit-app-585562805447.us-central1.run.app](https://logistics-audit-app-585562805447.us-central1.run.app)**
 
-# Build Ingestion Container
-docker build -t gcr.io/it-ai-briggs-agentspace/shipment-ingestion-job:latest ./ingestion
-```
+---
+
+## 🚧 Status & Outstanding Technical Roadmap
+
+> [!NOTE]
+> This branch represents the current deployed version on Cloud Run. The technical roadmap below outlines upcoming enhancements required for production completion.
+
+Refer to [`technical_handoff_and_future_roadmap.md`](file:///c:/Users/313581/.gemini/antigravity/brain/bee39098-fc99-468b-88c2-bf75abb7b039/technical_handoff_and_future_roadmap.md) for full implementation specifications.
+
+1. **Identity-Aware Proxy (IAP) User Authentication**:
+   * Bind each user's Identity-Aware Proxy header (`X-Goog-Authenticated-User-Email`) to Firestore `logistics-adk-db`.
+   * Restore user chat sessions automatically across browser hard-refreshes based on authenticated email identity.
+
+2. **Vertex AI Agent Engine Integration**:
+   * Deploy the ADK Master Agent orchestrator as a managed serverless agent using [`web_app/backend/deploy_agent_engine.py`](file:///c:/Users/313581/logistics-audit-ui/web_app/backend/deploy_agent_engine.py).
+
+3. **UI/UX Enhancements**:
+   * **Sync Drive Spinner**: Add polling on `/api/sync/status` to show a spinning progress state while `shipment-ingestion-job` executes on Cloud Run.
+   * **Historical Conversations Sidebar**: Add a collapsible left sidebar in `AgentCanvasView` allowing users to browse, toggle, create, or delete past audit conversation threads.
