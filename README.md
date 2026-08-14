@@ -10,23 +10,23 @@ The platform automatically ingests multi-document shipment packages (Commercial 
 
 ```mermaid
 graph TD
-    subgraph 1. Ingestion Phase (ingestion/)
-        GDrive["Google Drive\n(Target Ingestion Folder)"] -->|Scan & Group PDFs| CRJob["Cloud Run Job\n(shipment-ingestion-job)"]
-        CRJob -->|Upload PDFs| GCS["GCS Bucket\n(logistic-audit-pdfs)"]
-        CRJob -->|Archive Processed Files| GDriveProc["Google Drive\n(Processed Folder)"]
-        CRJob -->|Publish Message| PubSub["Pub/Sub Topic\n(shipment-processing-trigger)"]
+    subgraph Phase1["1. Ingestion Phase"]
+        GDrive["Google Drive Target Folder"] -->|Scan & Group PDFs| CRJob["Cloud Run Job: shipment-ingestion-job"]
+        CRJob -->|Upload PDFs| GCS["GCS Bucket: logistic-audit-pdfs"]
+        CRJob -->|Archive Processed Files| GDriveProc["Google Drive Processed Folder"]
+        CRJob -->|Publish Message| PubSub["Pub/Sub Topic: shipment-processing-trigger"]
     end
 
-    subgraph 2. Multimodal Extraction & Audit Phase (extractions/)
-        PubSub -->|Cloud Event| CloudFunc["Extractions Service\n(Cloud Run / Cloud Function)"]
-        CloudFunc -->|Async Multimodal Extraction| Gemini["Vertex AI / Gemini 2.5 Pro\n(Structured JSON Schemas)"]
+    subgraph Phase2["2. Multimodal Extractions & Audit Phase"]
+        PubSub -->|Cloud Event| CloudFunc["Extractions Service"]
+        CloudFunc -->|Async Extractions| Gemini["Vertex AI / Gemini 2.5 Pro"]
         Gemini -->|Structured JSON| CloudFunc
-        CloudFunc -->|Insert Structured Records| BQ_Raw["BigQuery Raw Tables\n(CIV_Tbl, PKL_Tbl, SLI_Tbl, VGM_Tbl)"]
-        CloudFunc -->|Execute SQL Reconciliation| BQ_Anom["BigQuery Anomalies Table\n(Shipment_Anomalies_Tbl)"]
+        CloudFunc -->|Insert Records| BQ_Raw["BigQuery Raw Tables"]
+        CloudFunc -->|Execute SQL Reconciliation| BQ_Anom["BigQuery Anomalies Table"]
     end
 
-    subgraph 3. Human-in-the-Loop Master Dashboard (app.py)
-        UI["Streamlit Master Dashboard\n(Cloud Run Service Port 8080/8501)"] <-->|Query Tables| BQ_Raw
+    subgraph Phase3["3. Human-in-the-Loop Master Dashboard"]
+        UI["Streamlit Master Dashboard"] <-->|Query Tables| BQ_Raw
         UI <-->|Fetch Discrepancies| BQ_Anom
         UI <-->|Render PDF Documents| GCS
     end
@@ -106,8 +106,8 @@ A web interface built with Streamlit providing logistics auditors with a control
 | Component | Resource ID / Name | Description |
 | :--- | :--- | :--- |
 | **GCP Project** | `it-ai-briggs-agentspace` | Target Google Cloud project. |
-| **GCP Region** | `us-central1` | Deployment region. |
-| **GCS Bucket** | `logistic-audit-pdfs` | Document storage (`shipment_{id}/`). |
+| **GCP Region** | `us-central1` | Default deployment region. |
+| **GCS Bucket** | `logistic-audit-pdfs` | Document storage bucket (`shipment_{id}/`). |
 | **Pub/Sub Topic** | `shipment-processing-trigger` | Asynchronous trigger topic. |
 | **Cloud Run Job** | `shipment-ingestion-job` | Ingestion container job. |
 | **BigQuery Dataset** | `logistics_dataset` | Data warehouse containing `CIV_Tbl`, `PKL_Tbl`, `SLI_Tbl`, `VGM_Tbl`, and `Shipment_Anomalies_Tbl`. |
